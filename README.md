@@ -51,8 +51,10 @@ assigned gateway with mTLS and holds the `ControlStream` open:
 
 * answers the console's proxied `/api/…` calls — currently
   `GET /api/system/info` (SONiC version, platform, HWSKU, serial),
-  `GET /api/system/health`, and `POST /api/system/reboot` — backed by
-  CONFIG_DB/STATE_DB and the platform CLIs;
+  `GET /api/system/health`, `POST /api/system/reboot`, and the
+  Configure → Switching pages' `GET /api/switching/ports`,
+  `GET /api/switching/port-channels`, and `GET /api/switching/vlans` —
+  backed by CONFIG_DB/STATE_DB/COUNTERS_DB and the platform CLIs;
 * pushes `DeviceStats` every ~30 s (CPU/mem/disk gauges plus true byte
   figures, uptime, best-effort public IP, and the top ~8 interfaces by
   traffic from COUNTERS_DB);

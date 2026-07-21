@@ -6,9 +6,12 @@
 //! the surface in-process means one less listener on the switch.
 //!
 //! Endpoints (start minimal; grow as the console grows):
-//!   GET  /api/system/info   — SONiC version, platform, HWSKU, serial, …
-//!   GET  /api/system/health — resource gauges + redis reachability
-//!   POST /api/system/reboot — graceful reboot via SONiC's `reboot` script
+//!   GET  /api/system/info             — SONiC version, platform, HWSKU, serial, …
+//!   GET  /api/system/health           — resource gauges + redis reachability
+//!   POST /api/system/reboot           — graceful reboot via SONiC's `reboot` script
+//!   GET  /api/switching/ports         — port inventory: status, VLANs, error counters
+//!   GET  /api/switching/port-channels — LAGs with per-member state
+//!   GET  /api/switching/vlans         — VLANs with members and L3 config
 //!
 //! Unknown paths get a 404-style ProxyResponse with `error` set; a bad
 //! request must never crash the stream.
@@ -33,6 +36,9 @@ enum Route {
     SystemInfo,
     SystemHealth,
     SystemReboot,
+    SwitchingPorts,
+    SwitchingPortChannels,
+    SwitchingVlans,
     NotFound,
     MethodNotAllowed { allowed: &'static str },
 }
@@ -52,6 +58,18 @@ fn route(method: &str, path: &str) -> Route {
         "/api/system/reboot" => match method {
             "POST" => Route::SystemReboot,
             _ => Route::MethodNotAllowed { allowed: "POST" },
+        },
+        "/api/switching/ports" => match method {
+            "GET" => Route::SwitchingPorts,
+            _ => Route::MethodNotAllowed { allowed: "GET" },
+        },
+        "/api/switching/port-channels" => match method {
+            "GET" => Route::SwitchingPortChannels,
+            _ => Route::MethodNotAllowed { allowed: "GET" },
+        },
+        "/api/switching/vlans" => match method {
+            "GET" => Route::SwitchingVlans,
+            _ => Route::MethodNotAllowed { allowed: "GET" },
         },
         _ => Route::NotFound,
     }
@@ -79,6 +97,9 @@ impl Api {
             }
             Route::SystemHealth => run_blocking(system_health).await,
             Route::SystemReboot => reboot(),
+            Route::SwitchingPorts => run_blocking(switching_ports).await,
+            Route::SwitchingPortChannels => run_blocking(switching_port_channels).await,
+            Route::SwitchingVlans => run_blocking(switching_vlans).await,
             Route::NotFound => (
                 404,
                 JSON.to_string(),
@@ -146,6 +167,40 @@ fn system_health() -> CallResult {
     (200, JSON.to_string(), json_body(&body), String::new())
 }
 
+fn switching_ports() -> CallResult {
+    match sonic::switching::ports() {
+        Ok(ports) => (200, JSON.to_string(), json_body(&json!({ "ports": ports })), String::new()),
+        Err(e) => redis_unreachable(&e),
+    }
+}
+
+fn switching_port_channels() -> CallResult {
+    match sonic::switching::port_channels() {
+        Ok(pcs) => (
+            200,
+            JSON.to_string(),
+            json_body(&json!({ "port_channels": pcs })),
+            String::new(),
+        ),
+        Err(e) => redis_unreachable(&e),
+    }
+}
+
+fn switching_vlans() -> CallResult {
+    match sonic::switching::vlans() {
+        Ok(vlans) => (200, JSON.to_string(), json_body(&json!({ "vlans": vlans })), String::new()),
+        Err(e) => redis_unreachable(&e),
+    }
+}
+
+/// CONFIG_DB itself was unreachable — the one condition the switching
+/// endpoints are allowed to fail on (anything less degrades to the contract's
+/// nulls/defaults inside the collectors).
+fn redis_unreachable(e: &anyhow::Error) -> CallResult {
+    let msg = format!("SONiC redis unreachable: {e:#}");
+    (500, JSON.to_string(), json_body(&json!({ "error": msg })), msg)
+}
+
 /// Kick off SONiC's graceful `reboot` script (falls back to /sbin/reboot),
 /// detached and delayed a few seconds so the 202 response reaches the
 /// controller before the box goes down.
@@ -185,6 +240,20 @@ mod tests {
         // Query strings and trailing slashes don't change the route.
         assert_eq!(route("GET", "/api/system/info?verbose=1"), Route::SystemInfo);
         assert_eq!(route("GET", "/api/system/info/"), Route::SystemInfo);
+    }
+
+    #[test]
+    fn routes_switching_endpoints() {
+        assert_eq!(route("GET", "/api/switching/ports"), Route::SwitchingPorts);
+        assert_eq!(
+            route("GET", "/api/switching/port-channels"),
+            Route::SwitchingPortChannels
+        );
+        assert_eq!(route("GET", "/api/switching/vlans"), Route::SwitchingVlans);
+        assert_eq!(
+            route("POST", "/api/switching/vlans"),
+            Route::MethodNotAllowed { allowed: "GET" }
+        );
     }
 
     #[test]

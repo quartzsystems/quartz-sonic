@@ -14,6 +14,7 @@ use crate::proto::device::PolicyStat;
 
 pub mod mgmtapi;
 pub mod stats;
+pub mod switching;
 pub mod telemetry;
 
 /// SONiC database ids (matching /var/run/redis/sonic-db/database_config.json).
@@ -57,6 +58,34 @@ fn hgetall(db: i64, key: &str) -> Result<HashMap<String, String>> {
         .arg(key)
         .query(&mut conn)
         .with_context(|| format!("HGETALL {key} (db {db})"))
+}
+
+/// HGETALL on an already-open connection; a missing key or a read error
+/// degrades to an empty hash (bulk readers must not fail per-row).
+fn hgetall_on(conn: &mut redis::Connection, key: &str) -> HashMap<String, String> {
+    redis::cmd("HGETALL").arg(key).query(conn).unwrap_or_default()
+}
+
+/// Every key matching a redis glob `pattern`, collected with cursor SCAN —
+/// never KEYS, which would block the instance all the SONiC daemons share.
+fn scan_keys(conn: &mut redis::Connection, pattern: &str) -> Result<Vec<String>> {
+    let mut keys = Vec::new();
+    let mut cursor: u64 = 0;
+    loop {
+        let (next, batch): (u64, Vec<String>) = redis::cmd("SCAN")
+            .arg(cursor)
+            .arg("MATCH")
+            .arg(pattern)
+            .arg("COUNT")
+            .arg(200)
+            .query(conn)
+            .with_context(|| format!("SCAN {pattern}"))?;
+        keys.extend(batch);
+        cursor = next;
+        if cursor == 0 {
+            return Ok(keys);
+        }
+    }
 }
 
 /// Whether the SONiC redis instance answers a PING (health probe).
