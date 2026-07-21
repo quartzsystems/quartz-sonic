@@ -1,0 +1,89 @@
+[package]
+name = "quartz-sonic"
+description = "Quartz Command fleet-management agent for SONiC switches: device identity, enrollment, and the persistent mTLS control channel."
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+authors = ["Quartz Systems <cwellman@quartz.systems>"]
+repository = "https://github.com/zagdrath/quartz-sonic"
+
+[[bin]]
+name = "quartz-sonic"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "net", "io-util"] }
+# Same tonic/prost line as qfagent so the fleet's gRPC stacks stay aligned.
+# TLS deliberately does NOT use tonic's `tls` feature: bootstrap trust is the
+# enrollment token's CA fingerprint pin, which needs a custom rustls verifier,
+# so connections are built with our own rustls config and handed to tonic
+# through `connect_with_connector` (see src/tls.rs).
+tonic = "0.11"
+prost = "0.12"
+# ReceiverStream: the outbound half of the ControlStream command channel.
+tokio-stream = "0.1"
+tower = { version = "0.4", features = ["util"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls-pemfile = "2"
+pem = "3"
+# x509-parser feature: CSR parsing, used by the mock controller in tests.
+rcgen = { version = "0.13", default-features = false, features = ["pem", "ring", "x509-parser"] }
+ed25519-dalek = { version = "2", features = ["pkcs8", "pem", "rand_core"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+sha2 = "0.10"
+x509-parser = "0.16"
+# CONFIG_DB / STATE_DB / COUNTERS_DB access (swsssdk-style, straight to the
+# SONiC redis instance). Sync client — every read runs inside spawn_blocking.
+redis = { version = "0.25", default-features = false }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# statvfs(3) for the DeviceStats disk-usage gauge — the one figure not exposed
+# under /proc. Linux-only; the collector reports 0 for disk on other targets.
+libc = "0.2"
+
+[build-dependencies]
+# protox is a pure-Rust protoc replacement so `cargo test` builds on dev
+# hosts without a protoc binary. protox 0.5 is the prost 0.12-compatible line.
+tonic-build = "0.11"
+protox = "0.5"
+prost = "0.12"
+prost-build = "0.12"
+
+[dev-dependencies]
+tempfile = "3"
+tokio-stream = "0.1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+# ── cargo deb ────────────────────────────────────────────────────────────────
+# Build with:  cargo deb --target x86_64-unknown-linux-musl
+# (static musl binary → one .deb runs on community and Enterprise SONiC across
+# Debian bases; see build-deb.sh).
+[package.metadata.deb]
+maintainer = "Quartz Systems <cwellman@quartz.systems>"
+copyright = "2026, Quartz Systems"
+extended-description = """\
+Enrolls a SONiC switch into Quartz Command and maintains a persistent mTLS
+control channel so the console can monitor and manage the switch. Ships the
+enroll/status CLI and the quartz-sonic.service daemon in one static binary."""
+section = "net"
+priority = "optional"
+# Static musl binary — no runtime library dependencies.
+depends = ""
+assets = [
+    ["target/release/quartz-sonic", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/quartz-sonic/README.md", "644"],
+]
+maintainer-scripts = "debian/"
+systemd-units = { unit-name = "quartz-sonic", enable = true, start = true, restart-after-upgrade = true }

@@ -1,0 +1,84 @@
+name: build-deb
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write # release uploads on tag builds
+
+env:
+  TARGET: x86_64-unknown-linux-musl
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # VERSION is the source of truth (build.rs enforces Cargo.toml matches
+      # it); a release tag must match it too.
+      - name: Check tag matches VERSION
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version="$(tr -d '[:space:]' < VERSION)"
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$tag" != "$version" ]; then
+            echo "tag v$tag does not match VERSION file ($version)" >&2
+            exit 1
+          fi
+
+      - name: Install Rust (musl target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      # ring's build script needs a musl C compiler for the static build.
+      - name: Install musl-tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-deb
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb
+
+      - name: Test (host target)
+        run: cargo test --locked
+
+      - name: Build (static musl)
+        run: cargo build --release --locked --target "$TARGET"
+
+      - name: Package
+        run: |
+          cargo deb --target "$TARGET" --no-build
+          DEB="$(ls -1 target/"$TARGET"/debian/quartz-sonic_*_amd64.deb | tail -n1)"
+          echo "DEB=$DEB" >> "$GITHUB_ENV"
+          # Stable-name copy so /releases/latest/download/… works as a
+          # one-liner without knowing the version.
+          cp "$DEB" quartz-sonic_amd64.deb
+          dpkg-deb --info "$DEB"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: quartz-sonic-deb
+          path: |
+            ${{ env.DEB }}
+            quartz-sonic_amd64.deb
+          if-no-files-found: error
+
+      # Tag builds (v*) publish a GitHub release carrying the versioned .deb
+      # plus the stable-name copy the README's install one-liner fetches.
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ env.DEB }}
+            quartz-sonic_amd64.deb
+          generate_release_notes: true

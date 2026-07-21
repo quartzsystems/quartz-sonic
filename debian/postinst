@@ -1,0 +1,17 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        # State (identity, certs) and config homes. StateDirectory= would
+        # also create the former, but enroll can run before the daemon ever
+        # starts, so make sure it exists root-only from the start.
+        mkdir -p /var/lib/quartz-sonic
+        chmod 0700 /var/lib/quartz-sonic
+        mkdir -p /etc/quartz-sonic
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

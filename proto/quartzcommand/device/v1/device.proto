@@ -1,0 +1,202 @@
+// mTLS-authenticated device service. The caller's identity (device_id, org,
+// public key) comes from the presented client certificate, never from the
+// request body.
+syntax = "proto3";
+
+package quartzcommand.device.v1;
+
+service DeviceService {
+  // Issue a fresh client certificate for the presented identity. The CSR must
+  // carry the same Ed25519 public key and CN=device_id as the current cert.
+  // Devices are expected to renew at 2/3 of cert lifetime (see
+  // renew_after_unix in the response).
+  rpc RenewCertificate(RenewCertificateRequest) returns (RenewCertificateResponse);
+
+  // Device-initiated command channel. The device opens the stream after
+  // connecting, announces itself with DeviceHello, and then answers the
+  // controller's ProxyRequests (local VyOS HTTP API calls) with
+  // ProxyResponses, matched by request_id. The controller closes the stream
+  // when the device should reconnect (e.g. gateway drain).
+  rpc ControlStream(stream DeviceMessage) returns (stream ControllerMessage);
+}
+
+message RenewCertificateRequest {
+  bytes csr_der = 1;
+}
+
+message RenewCertificateResponse {
+  bytes client_cert_der = 1;
+  repeated bytes ca_chain_der = 2;
+  int64 not_after_unix = 3;    // expiry of the new cert
+  int64 renew_after_unix = 4;  // 2/3 of lifetime — renew at/after this time
+}
+
+// ── Control stream ──────────────────────────────────────────────────────────
+
+message DeviceMessage {
+  oneof msg {
+    DeviceHello hello = 1;
+    ProxyResponse proxy_response = 2;
+    // Periodic security-service telemetry (see SecurityTelemetry). Sent
+    // unsolicited on a fixed interval (~60 s) after the DeviceHello. field 3
+    // is reserved for this message fleet-wide.
+    SecurityTelemetry security_telemetry = 3;
+    // Periodic device health & stats (see DeviceStats). Sent unsolicited on a
+    // fixed interval (~30 s) after the DeviceHello. field 4 is reserved for
+    // this message fleet-wide.
+    DeviceStats device_stats = 4;
+  }
+}
+
+message ControllerMessage {
+  oneof msg {
+    ProxyRequest proxy_request = 1;
+  }
+}
+
+// First message on the stream: current facts for the inventory record.
+message DeviceHello {
+  string hostname = 1;
+  string qf_version = 2;
+}
+
+// One HTTP call against the device's local management API (the
+// quartzfire-webui backend, which fronts the VyOS HTTP API and the device's
+// own endpoints). The device authenticates the call locally; the path is
+// always under /api/.
+message ProxyRequest {
+  string request_id = 1;
+  string method = 2;        // GET | POST | PUT | DELETE
+  string path = 3;          // path + optional query, e.g. "/api/retrieve"
+  string content_type = 4;  // request body content type ("" = no body)
+  bytes body = 5;
+}
+
+message ProxyResponse {
+  string request_id = 1;
+  uint32 http_status = 2;   // status from the local API (0 when unreachable)
+  string content_type = 3;
+  bytes body = 4;
+  string error = 5;         // non-empty when the local call itself failed
+}
+
+// ── Security-service telemetry ───────────────────────────────────────────────
+//
+// A snapshot of the device's security subsystems, pushed on a fixed interval.
+// Every counter is CUMULATIVE and monotonic-increasing within a service's
+// current run, but NOT strictly "since device boot": the underlying counters
+// reset when the source resets — a service restart, an nftables ruleset
+// reload, or a log-file rotation. Consumers should treat each counter like a
+// Prometheus counter (compute deltas, tolerate resets), anchoring on
+// time_unix. All four service blocks are always present; a service that is
+// disabled or not installed reports enabled=false with zero counters.
+message SecurityTelemetry {
+  // Device wall-clock when this snapshot was taken, UTC seconds since epoch.
+  int64 time_unix = 1;
+  // Nominal seconds between reports (the cadence, e.g. 60). Informational —
+  // the true spacing is time_unix deltas between successive messages.
+  uint32 interval_secs = 2;
+
+  IpsCounters ips = 3;
+  AppControlCounters app_control = 4;
+  GeoCounters geolocation = 5;
+  ContentFilterCounters content_filtering = 6;
+}
+
+// Intrusion Prevention (Suricata). Counters are derived by tallying the
+// persistent EVE alert log (/var/log/quartzfire/ips-alerts.json), so they
+// reset on that log's rotation.
+message IpsCounters {
+  bool enabled = 1;       // IPS desired-state enabled AND suricata running
+  uint64 prevented = 2;   // alerts whose action was "blocked" (dropped inline)
+  uint64 detected = 3;    // total signature-match alerts (all actions)
+  // Packets inspected: the latest EVE `stats` snapshot's decoder.pkts. 0 with
+  // scans_available=false when the stats output isn't producing yet (service
+  // just started / stats file absent).
+  uint64 scans = 4;
+  bool scans_available = 5;
+}
+
+// Application Control (qfappd / nDPI). Flow-based: "requests" here means flow
+// decisions, not HTTP requests. Source: /run/qfappd/status.json.
+message AppControlCounters {
+  bool enabled = 1;         // qfappd running
+  uint64 blocked = 2;       // flows blocked by policy
+  uint64 detected = 3;      // flows where nDPI identified an application
+  uint64 total_requests = 4; // total flow decisions made
+}
+
+// Geolocation blocking (nftables qz_geo table). Source:
+// /run/quartzfire-geoip/counters.json (named nft counters).
+message GeoCounters {
+  bool enabled = 1;             // geo table active / counters present
+  uint64 blocked = 2;           // packets dropped by geo block rules
+  uint64 connections = 3;       // new connections evaluated by geo policies
+  uint32 countries_blocked = 4; // distinct countries with >0 blocked packets
+}
+
+// Content Filtering (e2guardian). Counters are tallied from the JSON access
+// feed (/var/log/quartzfire/content-filtering.json); allowed/total are only
+// complete when the filter's log level is "all" (blocked-only logging
+// undercounts allowed). Resets on that log's rotation.
+message ContentFilterCounters {
+  bool enabled = 1;          // content filtering active
+  uint64 blocked = 2;        // requests denied
+  uint64 allowed = 3;        // requests allowed
+  uint64 total_requests = 4; // blocked + allowed
+}
+
+// ── Device health & stats ────────────────────────────────────────────────────
+//
+// A snapshot of the device's health and traffic, pushed on a fixed interval
+// (~30 s). Utilization gauges are instantaneous point-in-time readings the
+// agent has already averaged over its sample window; the controller retains a
+// short rolling history of them to drive the console's sparklines. The
+// top_policies counters are cumulative like the security ones. Fields the
+// agent can't determine are sent as their zero value ("" for public_ip).
+message DeviceStats {
+  // Device wall-clock when this snapshot was taken, UTC seconds since epoch.
+  int64 time_unix = 1;
+  // Nominal seconds between reports (the cadence, e.g. 30). Informational.
+  uint32 interval_secs = 2;
+
+  // Resource utilization as a 0–100 percentage, already averaged by the agent
+  // over its sample window.
+  double cpu_pct = 3;
+  double mem_pct = 4;
+  double disk_pct = 5;
+
+  // Seconds since the device booted.
+  int64 uptime_secs = 6;
+  // The device's public/WAN IP as it sees itself ("" when undetermined). This
+  // is the address the firewall reports, which may differ from the source IP
+  // the controller observes on the connection (NAT/proxied paths).
+  string public_ip = 7;
+
+  // The most active firewall policies (rules) by traffic, already sorted
+  // descending by the agent and capped to a small set (~8). Cumulative
+  // counters (Prometheus-counter semantics), reset when the ruleset reloads.
+  repeated PolicyStat top_policies = 8;
+
+  // Absolute memory and disk figures (bytes), so the console can show the
+  // WebUI's "Used / Free / Total" alongside the percentages. Zero when the
+  // agent doesn't report them (older builds) — the console then shows only the
+  // percentage. mem_* is RAM; disk_* is the root filesystem.
+  //
+  // Free is derived as total − used (so it includes any reserved space), NOT a
+  // separate avail figure — this matches the WebUI card. Note disk_pct stays
+  // df's used/(used+avail), so it won't exactly equal disk_used_bytes /
+  // disk_total_bytes when the root fs has reserved blocks; the gauge and the
+  // byte figures are independent readings.
+  uint64 mem_used_bytes = 9;
+  uint64 mem_total_bytes = 10;
+  uint64 disk_used_bytes = 11;
+  uint64 disk_total_bytes = 12;
+}
+
+// One firewall policy/rule's cumulative traffic counters.
+message PolicyStat {
+  string name = 1;   // human-readable rule/policy name
+  uint64 bytes = 2;  // bytes matched by the rule
+  uint64 hits = 3;   // packets/hits matched by the rule
+}

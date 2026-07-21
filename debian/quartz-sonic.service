@@ -1,0 +1,35 @@
+[Unit]
+Description=Quartz Command fleet-management agent for SONiC
+Documentation=file:/usr/share/doc/quartz-sonic/README.md
+# Outbound-only daemon: wants the network actually up. The redis databases
+# come up with the SONiC `database` container; the agent degrades gracefully
+# (and retries) until they do, so no hard After= on docker.
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/quartz-sonic run
+Restart=always
+RestartSec=2
+TimeoutStopSec=15
+
+# Root: the device private key is root-owned 0600, and reboot/decode-syseeprom
+# need it. StateDirectory owns /var/lib/quartz-sonic (0700), RuntimeDirectory
+# owns /run/quartz-sonic (status.json, world-readable).
+StateDirectory=quartz-sonic
+StateDirectoryMode=0700
+RuntimeDirectory=quartz-sonic
+RuntimeDirectoryMode=0755
+
+# Light sandboxing only: the agent legitimately shells out to `reboot` and
+# `decode-syseeprom`, and talks to redis over its unix socket — the heavier
+# systemd confinement options break at least one supported SONiC base.
+NoNewPrivileges=no
+PrivateTmp=yes
+ProtectHome=yes
+
+SyslogIdentifier=quartz-sonic
+
+[Install]
+WantedBy=multi-user.target

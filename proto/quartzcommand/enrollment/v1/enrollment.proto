@@ -1,0 +1,39 @@
+// Device enrollment bootstrap. Served WITHOUT a client-cert requirement (the
+// device has no cert yet); every other gateway service requires mTLS. The
+// QuartzFire firmware implements the client side of exactly this contract —
+// do not rename fields.
+syntax = "proto3";
+
+package quartzcommand.enrollment.v1;
+
+service EnrollmentService {
+  rpc BeginEnrollment(BeginEnrollmentRequest) returns (BeginEnrollmentResponse);
+  rpc CompleteEnrollment(CompleteEnrollmentRequest) returns (CompleteEnrollmentResponse);
+}
+
+message BeginEnrollmentRequest {
+  string token_id = 1;
+  bytes device_pubkey = 2;
+}
+
+message BeginEnrollmentResponse {
+  bytes nonce = 1;
+  string enrollment_session_id = 2;
+}
+
+message CompleteEnrollmentRequest {
+  string enrollment_session_id = 1;
+  string token_secret = 2;     // plaintext secret half of the token
+  string device_id = 3;        // must match derivation from device_pubkey
+  bytes nonce_signature = 4;   // Ed25519 sig over nonce
+  bytes csr_der = 5;           // CSR, CN=device_id
+  string hostname = 6;         // informational
+  string qf_version = 7;       // informational
+}
+
+message CompleteEnrollmentResponse {
+  bytes client_cert_der = 1;
+  repeated bytes ca_chain_der = 2;
+  string assigned_gateway = 3; // host:port for the device's control channel
+  string org_id = 4;
+}
