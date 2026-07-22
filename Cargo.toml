@@ -1,7 +1,7 @@
 [package]
 name = "quartz-sonic"
 description = "Quartz Command fleet-management agent for SONiC switches: device identity, enrollment, and the persistent mTLS control channel."
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 license = "GPL-2.0-or-later"
 authors = ["Quartz Systems <cwellman@quartz.systems>"]

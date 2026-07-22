@@ -12,6 +12,8 @@ use anyhow::{Context, Result};
 
 use crate::proto::device::PolicyStat;
 
+pub mod aaa;
+pub mod acl;
 pub mod bgp;
 pub mod igmp;
 pub mod isis;
@@ -19,11 +21,14 @@ pub mod l3;
 pub mod lldp;
 pub mod mgmtapi;
 pub mod ospf;
+pub mod policy;
 pub mod probe;
 pub mod stats;
+pub mod staticroutes;
 pub mod stp;
 pub mod store;
 pub mod switching;
+pub mod system;
 pub mod telemetry;
 
 /// SONiC database ids (matching /var/run/redis/sonic-db/database_config.json).

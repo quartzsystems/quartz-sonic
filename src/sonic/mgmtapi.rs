@@ -58,6 +58,44 @@
 //!   GET    /api/routing/isis                           — instance/interfaces/adjacencies (vtysh)
 //!   PUT    /api/routing/isis/instance                  — NET/level (net null = remove)
 //!   PUT    /api/routing/isis/interfaces/{name}         — per-interface IS-IS
+//!   GET    /api/routing/static-routes                  — STATIC_ROUTE rows as route documents
+//!   PUT    /api/routing/static-routes                  — upsert one (vrf, prefix) route
+//!   POST   /api/routing/static-routes/delete           — delete (POST-with-body: prefixes carry /)
+//!   GET    /api/routing/policy                         — prefix lists + route maps (vtysh)
+//!   PUT    /api/routing/policy/prefix-lists/{name}     — atomic whole-list replace
+//!   DELETE /api/routing/policy/prefix-lists/{name}     — refused while a route map matches it
+//!   PUT    /api/routing/policy/route-maps/{name}       — entries replace the live set
+//!   DELETE /api/routing/policy/route-maps/{name}       — refused while BGP/OSPF applies it
+//!
+//! Configure → System:
+//!   GET/PUT /api/system/general                        — hostname/timezone/NTP/syslog
+//!   GET/PUT /api/system/management                     — eth0 addressing (DHCP or static)
+//!   GET    /api/system/users                           — host accounts with roles
+//!   POST   /api/system/users                           — create a user
+//!   PUT    /api/system/users/{name}                    — role + optional password
+//!   DELETE /api/system/users/{name}                    — refused for builtin / last admin
+//!   GET/PUT /api/system/snmp                           — feature state, location/contact, communities
+//!   GET    /api/system/maintenance                     — images, last config save, uptime
+//!   POST   /api/system/maintenance/save-config         — `config save -y`
+//!   POST   /api/system/maintenance/set-next-image      — sonic-installer set-next-boot
+//!   POST   /api/system/maintenance/install-image       — sonic-installer install (long-running)
+//!   POST   /api/system/maintenance/reboot              — same handler as /api/system/reboot
+//!   GET    /api/system/maintenance/backup              — raw /etc/sonic/config_db.json
+//!   POST   /api/system/maintenance/restore             — write config_db.json + `config reload -y`
+//!
+//! Configure → Security:
+//!   GET    /api/security/acls                          — L3/L3V6/MAC tables with rules
+//!   POST   /api/security/acls                          — create a table
+//!   PUT    /api/security/acls/{name}                   — converge (type immutable)
+//!   DELETE /api/security/acls/{name}                   — table + rules
+//!   PUT    /api/security/acls/{name}/rules/{priority}  — upsert a rule
+//!   DELETE /api/security/acls/{name}/rules/{priority}
+//!   GET    /api/security/aaa                           — login order + TACACS+/RADIUS (keys write-only)
+//!   PUT    /api/security/aaa/authentication            — login order (must include "local")
+//!   PUT    /api/security/aaa/{tacacs|radius}           — global auth_type/timeout/key
+//!   POST   /api/security/aaa/{tacacs|radius}/servers   — add a server
+//!   PUT    /api/security/aaa/{tacacs|radius}/servers/{address}
+//!   DELETE /api/security/aaa/{tacacs|radius}/servers/{address}
 //!
 //! CONFIG_DB writes are persisted with `config save -y` (best-effort);
 //! IS-IS writes persist via `vtysh -c "write memory"` under the split
@@ -72,7 +110,7 @@ use serde_json::json;
 use crate::sonic;
 use crate::sonic::store::{Platform, SysPlatform};
 use crate::sonic::switching::{self, WriteError};
-use crate::sonic::{bgp, igmp, isis, l3, lldp, ospf, stp};
+use crate::sonic::{aaa, acl, bgp, igmp, isis, l3, lldp, ospf, policy, staticroutes, stp, system};
 
 /// A ProxyResponse body-tuple: (http_status, content_type, body, error).
 pub type CallResult = (u32, String, Vec<u8>, String);
@@ -133,6 +171,42 @@ enum Route {
     IsisGet,
     IsisInstancePut,
     IsisInterfacePut(String),
+    StaticRoutesGet,
+    StaticRoutePut,
+    StaticRouteDelete,
+    PolicyGet,
+    PolicyPrefixListPut(String),
+    PolicyPrefixListDelete(String),
+    PolicyRouteMapPut(String),
+    PolicyRouteMapDelete(String),
+    SystemGeneralGet,
+    SystemGeneralPut,
+    SystemManagementGet,
+    SystemManagementPut,
+    UsersGet,
+    UserCreate,
+    UserPut(String),
+    UserDelete(String),
+    SnmpGet,
+    SnmpPut,
+    MaintenanceGet,
+    MaintenanceSaveConfig,
+    MaintenanceSetNextImage,
+    MaintenanceInstallImage,
+    MaintenanceBackup,
+    MaintenanceRestore,
+    AclsGet,
+    AclCreate,
+    AclPut(String),
+    AclDelete(String),
+    AclRulePut(String, u32),
+    AclRuleDelete(String, u32),
+    AaaGet,
+    AaaAuthPut,
+    AaaGlobalPut(aaa::Proto),
+    AaaServerCreate(aaa::Proto),
+    AaaServerPut(aaa::Proto, String),
+    AaaServerDelete(aaa::Proto, String),
     NotFound,
     MethodNotAllowed { allowed: &'static str },
 }
@@ -285,6 +359,102 @@ fn route_features(method: &str, path: &str) -> Route {
         ["api", "routing", "isis", "instance"] => need("PUT", Route::IsisInstancePut),
         ["api", "routing", "isis", "interfaces", name] => {
             need("PUT", Route::IsisInterfacePut(name.to_string()))
+        }
+        // Static-route prefixes contain `/`, so the route travels in the
+        // body: the collection path takes PUT (upsert) and a POST …/delete.
+        ["api", "routing", "static-routes"] => match method {
+            "GET" => Route::StaticRoutesGet,
+            "PUT" => Route::StaticRoutePut,
+            _ => Route::MethodNotAllowed { allowed: "GET, PUT" },
+        },
+        ["api", "routing", "static-routes", "delete"] => need("POST", Route::StaticRouteDelete),
+        ["api", "routing", "policy"] => need("GET", Route::PolicyGet),
+        ["api", "routing", "policy", "prefix-lists", name] => match method {
+            "PUT" => Route::PolicyPrefixListPut(name.to_string()),
+            "DELETE" => Route::PolicyPrefixListDelete(name.to_string()),
+            _ => Route::MethodNotAllowed { allowed: "PUT, DELETE" },
+        },
+        ["api", "routing", "policy", "route-maps", name] => match method {
+            "PUT" => Route::PolicyRouteMapPut(name.to_string()),
+            "DELETE" => Route::PolicyRouteMapDelete(name.to_string()),
+            _ => Route::MethodNotAllowed { allowed: "PUT, DELETE" },
+        },
+        ["api", "system", "general"] => match method {
+            "GET" => Route::SystemGeneralGet,
+            "PUT" => Route::SystemGeneralPut,
+            _ => Route::MethodNotAllowed { allowed: "GET, PUT" },
+        },
+        ["api", "system", "management"] => match method {
+            "GET" => Route::SystemManagementGet,
+            "PUT" => Route::SystemManagementPut,
+            _ => Route::MethodNotAllowed { allowed: "GET, PUT" },
+        },
+        ["api", "system", "users"] => match method {
+            "GET" => Route::UsersGet,
+            "POST" => Route::UserCreate,
+            _ => Route::MethodNotAllowed { allowed: "GET, POST" },
+        },
+        ["api", "system", "users", name] => match method {
+            "PUT" => Route::UserPut(name.to_string()),
+            "DELETE" => Route::UserDelete(name.to_string()),
+            _ => Route::MethodNotAllowed { allowed: "PUT, DELETE" },
+        },
+        ["api", "system", "snmp"] => match method {
+            "GET" => Route::SnmpGet,
+            "PUT" => Route::SnmpPut,
+            _ => Route::MethodNotAllowed { allowed: "GET, PUT" },
+        },
+        ["api", "system", "maintenance"] => need("GET", Route::MaintenanceGet),
+        ["api", "system", "maintenance", "save-config"] => {
+            need("POST", Route::MaintenanceSaveConfig)
+        }
+        ["api", "system", "maintenance", "set-next-image"] => {
+            need("POST", Route::MaintenanceSetNextImage)
+        }
+        ["api", "system", "maintenance", "install-image"] => {
+            need("POST", Route::MaintenanceInstallImage)
+        }
+        ["api", "system", "maintenance", "reboot"] => need("POST", Route::SystemReboot),
+        ["api", "system", "maintenance", "backup"] => need("GET", Route::MaintenanceBackup),
+        ["api", "system", "maintenance", "restore"] => need("POST", Route::MaintenanceRestore),
+        ["api", "security", "acls"] => match method {
+            "GET" => Route::AclsGet,
+            "POST" => Route::AclCreate,
+            _ => Route::MethodNotAllowed { allowed: "GET, POST" },
+        },
+        ["api", "security", "acls", name] => match method {
+            "PUT" => Route::AclPut(name.to_string()),
+            "DELETE" => Route::AclDelete(name.to_string()),
+            _ => Route::MethodNotAllowed { allowed: "PUT, DELETE" },
+        },
+        ["api", "security", "acls", name, "rules", priority] => match priority.parse() {
+            // A non-numeric priority can't name a rule — 404, not 405.
+            Err(_) => Route::NotFound,
+            Ok(priority) => match method {
+                "PUT" => Route::AclRulePut(name.to_string(), priority),
+                "DELETE" => Route::AclRuleDelete(name.to_string(), priority),
+                _ => Route::MethodNotAllowed { allowed: "PUT, DELETE" },
+            },
+        },
+        ["api", "security", "aaa"] => need("GET", Route::AaaGet),
+        ["api", "security", "aaa", "authentication"] => need("PUT", Route::AaaAuthPut),
+        ["api", "security", "aaa", proto] => match aaa::Proto::from_path(proto) {
+            Some(p) => need("PUT", Route::AaaGlobalPut(p)),
+            None => Route::NotFound,
+        },
+        ["api", "security", "aaa", proto, "servers"] => match aaa::Proto::from_path(proto) {
+            Some(p) => need("POST", Route::AaaServerCreate(p)),
+            None => Route::NotFound,
+        },
+        ["api", "security", "aaa", proto, "servers", address] => {
+            match aaa::Proto::from_path(proto) {
+                Some(p) => match method {
+                    "PUT" => Route::AaaServerPut(p, address.to_string()),
+                    "DELETE" => Route::AaaServerDelete(p, address.to_string()),
+                    _ => Route::MethodNotAllowed { allowed: "PUT, DELETE" },
+                },
+                None => Route::NotFound,
+            }
         }
         _ => Route::NotFound,
     }
@@ -548,6 +718,204 @@ impl Api {
                 })
                 .await
             }
+            Route::StaticRoutesGet => run_blocking(|| doc_get(staticroutes::get)).await,
+            Route::StaticRoutePut => {
+                run_blocking(move || {
+                    with_platform_body(&body, true, |p, i: &staticroutes::RouteInput| {
+                        staticroutes::put(p, i)
+                    })
+                })
+                .await
+            }
+            Route::StaticRouteDelete => {
+                run_blocking(move || {
+                    with_platform_body(&body, true, |p, i: &staticroutes::RouteKey| {
+                        staticroutes::delete(p, i)
+                    })
+                })
+                .await
+            }
+            // Routing policy lives in FRR, not CONFIG_DB — the module runs
+            // `vtysh -c "write memory"` itself per the routing-config mode.
+            Route::PolicyGet => run_blocking(|| doc_get(policy::get)).await,
+            Route::PolicyPrefixListPut(name) => {
+                run_blocking(move || {
+                    with_platform_body(&body, false, |p, i: &policy::PrefixListInput| {
+                        policy::put_prefix_list(p, &name, i)
+                    })
+                })
+                .await
+            }
+            Route::PolicyPrefixListDelete(name) => {
+                run_blocking(move || platform_write(false, |p| policy::delete_prefix_list(p, &name)))
+                    .await
+            }
+            Route::PolicyRouteMapPut(name) => {
+                run_blocking(move || {
+                    with_platform_body(&body, false, |p, i: &policy::RouteMapInput| {
+                        policy::put_route_map(p, &name, i)
+                    })
+                })
+                .await
+            }
+            Route::PolicyRouteMapDelete(name) => {
+                run_blocking(move || platform_write(false, |p| policy::delete_route_map(p, &name)))
+                    .await
+            }
+            // ── Configure → System ──────────────────────────────────────────
+            Route::SystemGeneralGet => run_blocking(|| doc_get(system::get_general)).await,
+            Route::SystemGeneralPut => {
+                run_blocking(move || {
+                    with_platform_body(&body, true, |p, i: &system::GeneralInput| {
+                        system::put_general(p, i)
+                    })
+                })
+                .await
+            }
+            Route::SystemManagementGet => run_blocking(|| doc_get(system::get_management)).await,
+            Route::SystemManagementPut => {
+                run_blocking(move || {
+                    with_platform_body(&body, true, |p, i: &system::ManagementInput| {
+                        system::put_management(p, i)
+                    })
+                })
+                .await
+            }
+            // Users are host accounts, not CONFIG_DB — nothing to config-save.
+            Route::UsersGet => run_blocking(|| doc_get(system::get_users)).await,
+            Route::UserCreate => {
+                run_blocking(move || {
+                    with_platform_body(&body, false, |p, i: &system::UserCreate| {
+                        system::create_user(p, i)
+                    })
+                })
+                .await
+            }
+            Route::UserPut(name) => {
+                run_blocking(move || {
+                    with_platform_body(&body, false, |p, i: &system::UserUpdate| {
+                        system::update_user(p, &name, i)
+                    })
+                })
+                .await
+            }
+            Route::UserDelete(name) => {
+                run_blocking(move || platform_write(false, |p| system::delete_user(p, &name)))
+                    .await
+            }
+            Route::SnmpGet => run_blocking(|| doc_get(system::get_snmp)).await,
+            Route::SnmpPut => {
+                run_blocking(move || {
+                    with_platform_body(&body, true, |p, i: &system::SnmpInput| {
+                        system::put_snmp(p, i)
+                    })
+                })
+                .await
+            }
+            Route::MaintenanceGet => run_blocking(|| doc_get(system::get_maintenance)).await,
+            // save-config IS the persistence — no trailing config save.
+            Route::MaintenanceSaveConfig => {
+                run_blocking(|| platform_write(false, system::save_config)).await
+            }
+            Route::MaintenanceSetNextImage => {
+                run_blocking(move || {
+                    with_platform_body(&body, false, |p, i: &system::ImageInput| {
+                        system::set_next_image(p, i)
+                    })
+                })
+                .await
+            }
+            Route::MaintenanceInstallImage => {
+                run_blocking(move || {
+                    with_platform_body(&body, false, |p, i: &system::UrlInput| {
+                        system::install_image(p, i)
+                    })
+                })
+                .await
+            }
+            Route::MaintenanceBackup => run_blocking(backup_config).await,
+            Route::MaintenanceRestore => {
+                run_blocking(move || {
+                    with_platform_body(&body, false, |p, i: &system::RestoreInput| {
+                        system::restore(p, i)
+                    })
+                })
+                .await
+            }
+            // ── Configure → Security ────────────────────────────────────────
+            Route::AclsGet => run_blocking(|| doc_get(acl::get)).await,
+            Route::AclCreate => {
+                run_blocking(move || {
+                    with_platform_body(&body, true, |p, i: &acl::TableCreate| {
+                        acl::create_table(p, i)
+                    })
+                })
+                .await
+            }
+            Route::AclPut(name) => {
+                run_blocking(move || {
+                    with_platform_body(&body, true, |p, i: &acl::TableInput| {
+                        acl::update_table(p, &name, i)
+                    })
+                })
+                .await
+            }
+            Route::AclDelete(name) => {
+                run_blocking(move || platform_write(true, |p| acl::delete_table(p, &name))).await
+            }
+            Route::AclRulePut(name, priority) => {
+                run_blocking(move || {
+                    with_platform_body(&body, true, |p, i: &acl::RuleInput| {
+                        acl::put_rule(p, &name, priority, i)
+                    })
+                })
+                .await
+            }
+            Route::AclRuleDelete(name, priority) => {
+                run_blocking(move || {
+                    platform_write(true, |p| acl::delete_rule(p, &name, priority))
+                })
+                .await
+            }
+            Route::AaaGet => run_blocking(|| doc_get(aaa::get)).await,
+            Route::AaaAuthPut => {
+                run_blocking(move || {
+                    with_platform_body(&body, true, |p, i: &aaa::AuthenticationInput| {
+                        aaa::put_authentication(p, i)
+                    })
+                })
+                .await
+            }
+            Route::AaaGlobalPut(proto) => {
+                run_blocking(move || {
+                    with_platform_body(&body, true, |p, i: &aaa::GlobalInput| {
+                        aaa::put_global(p, proto, i)
+                    })
+                })
+                .await
+            }
+            Route::AaaServerCreate(proto) => {
+                run_blocking(move || {
+                    with_platform_body(&body, true, |p, i: &aaa::ServerCreate| {
+                        aaa::create_server(p, proto, i)
+                    })
+                })
+                .await
+            }
+            Route::AaaServerPut(proto, address) => {
+                run_blocking(move || {
+                    with_platform_body(&body, true, |p, i: &aaa::ServerInput| {
+                        aaa::update_server(p, proto, &address, i)
+                    })
+                })
+                .await
+            }
+            Route::AaaServerDelete(proto, address) => {
+                run_blocking(move || {
+                    platform_write(true, |p| aaa::delete_server(p, proto, &address))
+                })
+                .await
+            }
             Route::NotFound => (
                 404,
                 JSON.to_string(),
@@ -688,6 +1056,16 @@ where
             write_outcome_with(op(&mut plat, &v), persist)
         }
         Err(msg) => error_response(400, msg),
+    }
+}
+
+/// GET /api/system/maintenance/backup — the raw config_db.json bytes (the
+/// console downloads them as a file), not a JSON document envelope.
+fn backup_config() -> CallResult {
+    let mut plat = SysPlatform::new();
+    match sonic::system::backup(&mut plat) {
+        Ok(text) => (200, JSON.to_string(), text.into_bytes(), String::new()),
+        Err(e) => write_outcome_with(Err(e), false),
     }
 }
 
@@ -941,6 +1319,116 @@ mod tests {
             Route::MethodNotAllowed { allowed: "PUT" }
         );
         assert_eq!(route("PUT", "/api/routing/nope"), Route::NotFound);
+    }
+
+    #[test]
+    fn routes_static_route_and_policy_endpoints() {
+        assert_eq!(route("GET", "/api/routing/static-routes"), Route::StaticRoutesGet);
+        assert_eq!(route("PUT", "/api/routing/static-routes"), Route::StaticRoutePut);
+        assert_eq!(route("POST", "/api/routing/static-routes/delete"), Route::StaticRouteDelete);
+        assert_eq!(
+            route("DELETE", "/api/routing/static-routes"),
+            Route::MethodNotAllowed { allowed: "GET, PUT" }
+        );
+        assert_eq!(route("GET", "/api/routing/policy"), Route::PolicyGet);
+        assert_eq!(
+            route("PUT", "/api/routing/policy/prefix-lists/LAN"),
+            Route::PolicyPrefixListPut("LAN".into())
+        );
+        assert_eq!(
+            route("DELETE", "/api/routing/policy/prefix-lists/LAN"),
+            Route::PolicyPrefixListDelete("LAN".into())
+        );
+        assert_eq!(
+            route("PUT", "/api/routing/policy/route-maps/RM-IN"),
+            Route::PolicyRouteMapPut("RM-IN".into())
+        );
+        assert_eq!(
+            route("DELETE", "/api/routing/policy/route-maps/RM-IN"),
+            Route::PolicyRouteMapDelete("RM-IN".into())
+        );
+    }
+
+    #[test]
+    fn routes_system_endpoints() {
+        assert_eq!(route("GET", "/api/system/general"), Route::SystemGeneralGet);
+        assert_eq!(route("PUT", "/api/system/general"), Route::SystemGeneralPut);
+        assert_eq!(route("GET", "/api/system/management"), Route::SystemManagementGet);
+        assert_eq!(route("PUT", "/api/system/management"), Route::SystemManagementPut);
+        assert_eq!(route("GET", "/api/system/users"), Route::UsersGet);
+        assert_eq!(route("POST", "/api/system/users"), Route::UserCreate);
+        assert_eq!(route("PUT", "/api/system/users/cody"), Route::UserPut("cody".into()));
+        assert_eq!(route("DELETE", "/api/system/users/cody"), Route::UserDelete("cody".into()));
+        assert_eq!(route("GET", "/api/system/snmp"), Route::SnmpGet);
+        assert_eq!(route("PUT", "/api/system/snmp"), Route::SnmpPut);
+        assert_eq!(route("GET", "/api/system/maintenance"), Route::MaintenanceGet);
+        assert_eq!(
+            route("POST", "/api/system/maintenance/save-config"),
+            Route::MaintenanceSaveConfig
+        );
+        assert_eq!(
+            route("POST", "/api/system/maintenance/set-next-image"),
+            Route::MaintenanceSetNextImage
+        );
+        assert_eq!(
+            route("POST", "/api/system/maintenance/install-image"),
+            Route::MaintenanceInstallImage
+        );
+        // The maintenance reboot is the same handler as /api/system/reboot.
+        assert_eq!(route("POST", "/api/system/maintenance/reboot"), Route::SystemReboot);
+        assert_eq!(route("GET", "/api/system/maintenance/backup"), Route::MaintenanceBackup);
+        assert_eq!(route("POST", "/api/system/maintenance/restore"), Route::MaintenanceRestore);
+        assert_eq!(
+            route("GET", "/api/system/maintenance/save-config"),
+            Route::MethodNotAllowed { allowed: "POST" }
+        );
+    }
+
+    #[test]
+    fn routes_security_endpoints() {
+        assert_eq!(route("GET", "/api/security/acls"), Route::AclsGet);
+        assert_eq!(route("POST", "/api/security/acls"), Route::AclCreate);
+        assert_eq!(route("PUT", "/api/security/acls/SP"), Route::AclPut("SP".into()));
+        assert_eq!(route("DELETE", "/api/security/acls/SP"), Route::AclDelete("SP".into()));
+        assert_eq!(
+            route("PUT", "/api/security/acls/SP/rules/100"),
+            Route::AclRulePut("SP".into(), 100)
+        );
+        assert_eq!(
+            route("DELETE", "/api/security/acls/SP/rules/100"),
+            Route::AclRuleDelete("SP".into(), 100)
+        );
+        // A non-numeric priority can't name a rule.
+        assert_eq!(route("PUT", "/api/security/acls/SP/rules/abc"), Route::NotFound);
+
+        assert_eq!(route("GET", "/api/security/aaa"), Route::AaaGet);
+        assert_eq!(route("PUT", "/api/security/aaa/authentication"), Route::AaaAuthPut);
+        assert_eq!(
+            route("PUT", "/api/security/aaa/tacacs"),
+            Route::AaaGlobalPut(aaa::Proto::Tacacs)
+        );
+        assert_eq!(
+            route("PUT", "/api/security/aaa/radius"),
+            Route::AaaGlobalPut(aaa::Proto::Radius)
+        );
+        assert_eq!(route("PUT", "/api/security/aaa/kerberos"), Route::NotFound);
+        assert_eq!(
+            route("POST", "/api/security/aaa/tacacs/servers"),
+            Route::AaaServerCreate(aaa::Proto::Tacacs)
+        );
+        assert_eq!(
+            route("PUT", "/api/security/aaa/radius/servers/10.0.0.30"),
+            Route::AaaServerPut(aaa::Proto::Radius, "10.0.0.30".into())
+        );
+        assert_eq!(
+            route("DELETE", "/api/security/aaa/tacacs/servers/10.0.0.20"),
+            Route::AaaServerDelete(aaa::Proto::Tacacs, "10.0.0.20".into())
+        );
+        assert_eq!(route("POST", "/api/security/aaa/kerberos/servers"), Route::NotFound);
+        assert_eq!(
+            route("GET", "/api/security/aaa/authentication"),
+            Route::MethodNotAllowed { allowed: "PUT" }
+        );
     }
 
     /// Feature write bodies parse before any platform access, so bad

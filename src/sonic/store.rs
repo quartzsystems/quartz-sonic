@@ -32,10 +32,14 @@ pub trait Platform {
     fn exists(&mut self, db: i64, key: &str) -> Result<bool>;
     /// Run a command to completion and capture its output.
     fn run(&mut self, program: &str, args: &[&str]) -> Result<CmdOutput>;
+    /// Run a command feeding `input` on stdin (chpasswd-style tools that
+    /// refuse secrets on the command line, where they'd be visible in ps).
+    fn run_input(&mut self, program: &str, args: &[&str], input: &str) -> Result<CmdOutput>;
     /// Start a command detached (for operations like the mgmt-VRF toggle that
     /// restart the very services a synchronous wait would hang on).
     fn spawn(&mut self, program: &str, args: &[&str]) -> Result<()>;
     fn read_file(&mut self, path: &str) -> Option<String>;
+    fn write_file(&mut self, path: &str, content: &str) -> Result<()>;
 }
 
 // ── the real switch ─────────────────────────────────────────────────────────
@@ -129,6 +133,26 @@ impl Platform for SysPlatform {
         })
     }
 
+    fn run_input(&mut self, program: &str, args: &[&str], input: &str) -> Result<CmdOutput> {
+        use std::io::Write;
+        let mut child = std::process::Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .with_context(|| format!("run {program}"))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(input.as_bytes()).with_context(|| format!("write {program} stdin"))?;
+        }
+        let out = child.wait_with_output().with_context(|| format!("wait for {program}"))?;
+        Ok(CmdOutput {
+            ok: out.status.success(),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        })
+    }
+
     fn spawn(&mut self, program: &str, args: &[&str]) -> Result<()> {
         std::process::Command::new(program)
             .args(args)
@@ -142,6 +166,10 @@ impl Platform for SysPlatform {
 
     fn read_file(&mut self, path: &str) -> Option<String> {
         std::fs::read_to_string(path).ok()
+    }
+
+    fn write_file(&mut self, path: &str, content: &str) -> Result<()> {
+        std::fs::write(path, content).with_context(|| format!("write {path}"))
     }
 }
 
@@ -196,6 +224,11 @@ pub fn feature_lock(feature: &str) -> MutexGuard<'static, ()> {
     static BGP: Mutex<()> = Mutex::new(());
     static OSPF: Mutex<()> = Mutex::new(());
     static ISIS: Mutex<()> = Mutex::new(());
+    static STATIC_ROUTES: Mutex<()> = Mutex::new(());
+    static POLICY: Mutex<()> = Mutex::new(());
+    static SYSTEM: Mutex<()> = Mutex::new(());
+    static ACL: Mutex<()> = Mutex::new(());
+    static AAA: Mutex<()> = Mutex::new(());
     static MISC: Mutex<()> = Mutex::new(());
     let m = match feature {
         "stp" => &STP,
@@ -205,6 +238,11 @@ pub fn feature_lock(feature: &str) -> MutexGuard<'static, ()> {
         "bgp" => &BGP,
         "ospf" => &OSPF,
         "isis" => &ISIS,
+        "static-routes" => &STATIC_ROUTES,
+        "policy" => &POLICY,
+        "system" => &SYSTEM,
+        "acl" => &ACL,
+        "aaa" => &AAA,
         _ => &MISC,
     };
     m.lock().unwrap_or_else(|p| p.into_inner())
@@ -297,6 +335,9 @@ pub mod mem {
         /// commands succeed with empty output.
         pub cmd_outputs: Vec<(Vec<String>, CmdOutput)>,
         pub log: Vec<String>,
+        /// Stdin fed to run_input calls, in order (kept out of `log` — it
+        /// carries secrets).
+        pub stdins: Vec<String>,
         /// Fail exactly the Nth mutation (1-based) — later ones succeed, so
         /// rollback paths can be exercised (rollback tests).
         pub fail_at_write: Option<usize>,
@@ -431,6 +472,21 @@ pub mod mem {
             Ok(CmdOutput { ok: true, ..Default::default() })
         }
 
+        fn run_input(&mut self, program: &str, args: &[&str], input: &str) -> Result<CmdOutput> {
+            // Stdin is captured separately, never logged with the command —
+            // it carries secrets (chpasswd) even in tests.
+            self.stdins.push(input.to_string());
+            let mut full = vec![program.to_string()];
+            full.extend(args.iter().map(|s| s.to_string()));
+            self.log.push(format!("RUN-INPUT {}", full.join(" ")));
+            for (prefix, out) in &self.cmd_outputs {
+                if full.len() >= prefix.len() && full[..prefix.len()] == prefix[..] {
+                    return Ok(out.clone());
+                }
+            }
+            Ok(CmdOutput { ok: true, ..Default::default() })
+        }
+
         fn spawn(&mut self, program: &str, args: &[&str]) -> Result<()> {
             self.log.push(format!("SPAWN {program} {}", args.join(" ")));
             Ok(())
@@ -438,6 +494,12 @@ pub mod mem {
 
         fn read_file(&mut self, path: &str) -> Option<String> {
             self.files.get(path).cloned()
+        }
+
+        fn write_file(&mut self, path: &str, content: &str) -> Result<()> {
+            self.log.push(format!("WRITE-FILE {path}"));
+            self.files.insert(path.to_string(), content.to_string());
+            Ok(())
         }
     }
 
