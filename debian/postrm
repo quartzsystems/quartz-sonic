@@ -1,0 +1,17 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    remove|purge)
+        # Drop the /lib/systemd/system alias the postinst creates on
+        # non-usr-merged images, once the real unit is gone.
+        if [ -L /lib/systemd/system/quartz-sonic.service ] \
+            && [ ! -e /usr/lib/systemd/system/quartz-sonic.service ]; then
+            rm -f /lib/systemd/system/quartz-sonic.service
+        fi
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

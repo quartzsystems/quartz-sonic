@@ -9,6 +9,18 @@ case "$1" in
         mkdir -p /var/lib/quartz-sonic
         chmod 0700 /var/lib/quartz-sonic
         mkdir -p /etc/quartz-sonic
+
+        # cargo-deb ships the unit in /usr/lib/systemd/system, but SONiC
+        # images are not usr-merged and their deb-systemd-helper predates
+        # the /usr/lib search path ("unable to read quartz-sonic.service").
+        # Alias the unit into /lib/systemd/system where it looks; a no-op
+        # on usr-merged systems, where that path already resolves.
+        if [ ! -e /lib/systemd/system/quartz-sonic.service ] \
+            && [ -f /usr/lib/systemd/system/quartz-sonic.service ]; then
+            mkdir -p /lib/systemd/system
+            ln -sf /usr/lib/systemd/system/quartz-sonic.service \
+                /lib/systemd/system/quartz-sonic.service
+        fi
         ;;
 esac
 
