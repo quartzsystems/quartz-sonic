@@ -18,6 +18,7 @@ pub mod switching;
 pub mod telemetry;
 
 /// SONiC database ids (matching /var/run/redis/sonic-db/database_config.json).
+pub const APPL_DB: i64 = 0;
 pub const COUNTERS_DB: i64 = 2;
 pub const CONFIG_DB: i64 = 4;
 pub const STATE_DB: i64 = 6;

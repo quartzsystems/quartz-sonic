@@ -1,21 +1,32 @@
-//! Read-only switching state for the console's Configure → Switching pages:
-//! ports, port channels, and VLANs, assembled from CONFIG_DB / STATE_DB /
-//! COUNTERS_DB.
+//! Switching state and configuration for the console's Configure → Switching
+//! pages: ports, port channels, and VLANs, read from CONFIG_DB / APPL_DB /
+//! STATE_DB / COUNTERS_DB and written back to CONFIG_DB.
 //!
-//! The collectors degrade per-field, never per-endpoint: a missing STATE_DB
-//! row, an absent counters entry, or a garbled value produces that field's
-//! documented null/default, and every object present in CONFIG_DB still
-//! appears in the response. Only an unreachable CONFIG_DB returns an error
-//! (the management API turns that into an error ProxyResponse). All redis
-//! reads run inside the management API's spawn_blocking.
+//! Port and LAG oper state comes from APPL_DB (`PORT_TABLE:<name>` /
+//! `LAG_TABLE:<name>`, colon-separated keys — the same source `show
+//! interfaces status` uses), with the STATE_DB `|`-separated rows as a
+//! fallback; STATE_DB's PORT_TABLE mostly carries transceiver/init state.
+//!
+//! The read collectors degrade per-field, never per-endpoint: a missing
+//! APPL_DB/STATE_DB row, an absent counters entry, or a garbled value
+//! produces that field's documented null/default, and every object present
+//! in CONFIG_DB still appears in the response. Only an unreachable CONFIG_DB
+//! returns an error (the management API turns that into an error
+//! ProxyResponse).
+//!
+//! The write operations converge CONFIG_DB toward the request's desired
+//! state: lists in a payload are full sets, diffed against the current rows
+//! so unchanged rows are never touched. Validation failures surface as
+//! [`WriteError::BadRequest`]/[`WriteError::NotFound`] before anything is
+//! written. All redis access runs inside the management API's spawn_blocking.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
-use anyhow::Result;
-use serde::Serialize;
+use anyhow::{Context, Result};
+use serde::{Deserialize, Deserializer, Serialize};
 
-use super::{connection, hgetall_on, scan_keys, CONFIG_DB, COUNTERS_DB, STATE_DB};
+use super::{connection, hgetall_on, scan_keys, APPL_DB, CONFIG_DB, COUNTERS_DB, STATE_DB};
 
 // ── ports ───────────────────────────────────────────────────────────────────
 
@@ -56,25 +67,28 @@ pub fn ports() -> Result<Vec<Port>> {
             .to_string();
         vlan_rows.entry(member.to_string()).or_default().push((id, mode));
     }
+    let mut appl = connection(APPL_DB).ok();
     let mut state = connection(STATE_DB).ok();
     let counters = port_counters();
     let mut out = Vec::with_capacity(port_keys.len());
     for key in &port_keys {
         let Some(name) = key_suffix(key, "PORT|") else { continue };
         let cfg_row = hgetall_on(&mut cfg, key);
+        let appl_row = state_row(&mut appl, &format!("PORT_TABLE:{name}"));
         let state_row = state_row(&mut state, &format!("PORT_TABLE|{name}"));
         let rows = vlan_rows.get(name).map(Vec::as_slice).unwrap_or(&[]);
-        out.push(port_from(name, &cfg_row, &state_row, counters.get(name), rows));
+        out.push(port_from(name, &cfg_row, &appl_row, &state_row, counters.get(name), rows));
     }
     out.sort_by(|a, b| natural_cmp(&a.name, &b.name));
     Ok(out)
 }
 
-/// Assemble one port from its CONFIG_DB row, STATE_DB row, counters hash
-/// (None = no COUNTERS entry), and VLAN membership rows. Pure.
+/// Assemble one port from its CONFIG_DB row, APPL_DB row, STATE_DB row,
+/// counters hash (None = no COUNTERS entry), and VLAN membership rows. Pure.
 pub fn port_from(
     name: &str,
     cfg: &HashMap<String, String>,
+    appl: &HashMap<String, String>,
     state: &HashMap<String, String>,
     counters: Option<&HashMap<String, String>>,
     vlan_rows: &[(u32, String)],
@@ -88,8 +102,10 @@ pub fn port_from(
         alias: field(cfg, "alias").map(str::to_string),
         description: field(cfg, "description").map(str::to_string),
         admin_status: field(cfg, "admin_status").unwrap_or("down").to_string(),
-        oper_status: field(state, "oper_status").unwrap_or("unknown").to_string(),
-        speed_mbps: parse_num(field(state, "speed")).or_else(|| parse_num(field(cfg, "speed"))),
+        oper_status: oper_status_of(appl, state),
+        speed_mbps: parse_num(field(appl, "speed"))
+            .or_else(|| parse_num(field(state, "speed")))
+            .or_else(|| parse_num(field(cfg, "speed"))),
         fec: field(cfg, "fec").map(str::to_string),
         mtu: parse_num(field(cfg, "mtu")),
         vlan_mode,
@@ -185,6 +201,7 @@ pub fn port_channels() -> Result<Vec<PortChannel>> {
             member_names.entry(pc.to_string()).or_default().push(port.to_string());
         }
     }
+    let mut appl = connection(APPL_DB).ok();
     let mut state = connection(STATE_DB).ok();
     let mut out = Vec::with_capacity(pc_keys.len());
     for key in &pc_keys {
@@ -204,7 +221,7 @@ pub fn port_channels() -> Result<Vec<PortChannel>> {
                     lacp_selected(&state_row(&mut state, &format!("LAG_MEMBER_TABLE|{name}|{port}")))
                 };
                 PortChannelMember {
-                    oper_status: member_oper(&mut state, &port),
+                    oper_status: member_oper(&mut appl, &mut state, &port),
                     name: port,
                     selected,
                 }
@@ -214,9 +231,10 @@ pub fn port_channels() -> Result<Vec<PortChannel>> {
             name: name.to_string(),
             protocol: if is_static { "static" } else { "lacp" },
             admin_status: field(&row, "admin_status").unwrap_or("down").to_string(),
-            oper_status: field(&state_row(&mut state, &format!("LAG_TABLE|{name}")), "oper_status")
-                .unwrap_or("unknown")
-                .to_string(),
+            oper_status: oper_status_of(
+                &state_row(&mut appl, &format!("LAG_TABLE:{name}")),
+                &state_row(&mut state, &format!("LAG_TABLE|{name}")),
+            ),
             mtu: parse_num(field(&row, "mtu")),
             min_links: parse_num(field(&row, "min_links")),
             fallback: parse_bool(field(&row, "fallback")).unwrap_or(false),
@@ -407,13 +425,683 @@ fn state_row(conn: &mut Option<redis::Connection>, key: &str) -> HashMap<String,
     conn.as_mut().map(|c| hgetall_on(c, key)).unwrap_or_default()
 }
 
-/// Oper status for a member name: PORT_TABLE for ports, LAG_TABLE for
-/// PortChannels (member names can be either).
-fn member_oper(state: &mut Option<redis::Connection>, name: &str) -> String {
-    let table = if name.starts_with("PortChannel") { "LAG_TABLE" } else { "PORT_TABLE" };
-    field(&state_row(state, &format!("{table}|{name}")), "oper_status")
+/// Oper status from an APPL_DB row first (the authoritative source — what
+/// `show interfaces status` reads), then the STATE_DB row, then "unknown".
+/// Pure.
+pub fn oper_status_of(appl: &HashMap<String, String>, state: &HashMap<String, String>) -> String {
+    field(appl, "oper_status")
+        .or_else(|| field(state, "oper_status"))
         .unwrap_or("unknown")
         .to_string()
+}
+
+/// Oper status for a member name: PORT_TABLE for ports, LAG_TABLE for
+/// PortChannels (member names can be either). APPL_DB uses `:` key
+/// separators, STATE_DB `|`.
+fn member_oper(
+    appl: &mut Option<redis::Connection>,
+    state: &mut Option<redis::Connection>,
+    name: &str,
+) -> String {
+    let table = if name.starts_with("PortChannel") { "LAG_TABLE" } else { "PORT_TABLE" };
+    oper_status_of(
+        &state_row(appl, &format!("{table}:{name}")),
+        &state_row(state, &format!("{table}|{name}")),
+    )
+}
+
+// ── write operations ────────────────────────────────────────────────────────
+
+/// How a switching write fails. The management API maps these onto the HTTP
+/// statuses the console expects: invalid payloads → 400, unknown resources →
+/// 404, and an unreachable/failed redis → the existing 500 shape.
+#[derive(Debug)]
+pub enum WriteError {
+    BadRequest(String),
+    NotFound(String),
+    Redis(anyhow::Error),
+}
+
+impl From<anyhow::Error> for WriteError {
+    fn from(e: anyhow::Error) -> Self {
+        WriteError::Redis(e)
+    }
+}
+
+type WriteResult = std::result::Result<(), WriteError>;
+
+fn bad(msg: impl Into<String>) -> WriteError {
+    WriteError::BadRequest(msg.into())
+}
+
+/// Parse a JSON request body; the message is safe to surface in a 400.
+pub fn parse_json<T: serde::de::DeserializeOwned>(body: &[u8]) -> std::result::Result<T, String> {
+    serde_json::from_slice(body).map_err(|e| format!("invalid body: {e}"))
+}
+
+/// Deserialize a present field as Some(inner) so a handler can distinguish
+/// omitted (None — leave untouched) from null (Some(None) — clear).
+fn present<'de, T, D>(d: D) -> std::result::Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: Deserializer<'de>,
+{
+    Option::<T>::deserialize(d).map(Some)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AdminStatus {
+    Up,
+    Down,
+}
+
+impl AdminStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            AdminStatus::Up => "up",
+            AdminStatus::Down => "down",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VlanModeInput {
+    Access,
+    Trunk,
+    Routed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LagProtocol {
+    Lacp,
+    Static,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Tagging {
+    Tagged,
+    Untagged,
+}
+
+impl Tagging {
+    fn as_str(self) -> &'static str {
+        match self {
+            Tagging::Tagged => "tagged",
+            Tagging::Untagged => "untagged",
+        }
+    }
+}
+
+/// `PUT /api/switching/ports/{name}` body — a patch: omitted fields stay
+/// untouched, explicit nulls clear the CONFIG_DB field.
+#[derive(Debug, Default, PartialEq, Deserialize)]
+pub struct PortPatch {
+    #[serde(default, deserialize_with = "present")]
+    pub description: Option<Option<String>>,
+    pub admin_status: Option<AdminStatus>,
+    #[serde(default, deserialize_with = "present")]
+    pub mtu: Option<Option<u64>>,
+    #[serde(default, deserialize_with = "present")]
+    pub speed_mbps: Option<Option<u64>>,
+    #[serde(default, deserialize_with = "present")]
+    pub fec: Option<Option<String>>,
+    pub vlan_mode: Option<VlanModeInput>,
+    #[serde(default, deserialize_with = "present")]
+    pub untagged_vlan: Option<Option<u32>>,
+    pub tagged_vlans: Option<Vec<u32>>,
+}
+
+/// One member entry in a VLAN payload.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct VlanMemberInput {
+    pub name: String,
+    pub tagging: Tagging,
+}
+
+/// `POST/PUT /api/switching/vlans` body (create carries `vlan_id` too). The
+/// lists are full desired sets; absent/null description means no description.
+#[derive(Debug, Default, Deserialize)]
+pub struct VlanInput {
+    pub description: Option<String>,
+    #[serde(default)]
+    pub ip_addresses: Vec<String>,
+    #[serde(default)]
+    pub dhcp_helpers: Vec<String>,
+    #[serde(default)]
+    pub members: Vec<VlanMemberInput>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VlanCreate {
+    pub vlan_id: u32,
+    #[serde(flatten)]
+    pub input: VlanInput,
+}
+
+/// `POST/PUT /api/switching/port-channels` body (create carries `name` too).
+/// Unlike PortPatch this is a full desired object: absent/null mtu and
+/// min_links mean "not configured" and clear the field.
+#[derive(Debug, Deserialize)]
+pub struct PortChannelInput {
+    pub protocol: LagProtocol,
+    pub admin_status: AdminStatus,
+    pub mtu: Option<u64>,
+    pub min_links: Option<u64>,
+    #[serde(default)]
+    pub fallback: bool,
+    #[serde(default)]
+    pub fast_rate: bool,
+    #[serde(default)]
+    pub members: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PortChannelCreate {
+    pub name: String,
+    #[serde(flatten)]
+    pub input: PortChannelInput,
+}
+
+// ── pure validation / diff helpers ──────────────────────────────────────────
+
+/// The desired VLAN_MEMBER rows (vlan id → tagging_mode) for a port under a
+/// patch's vlan_mode triple. Errors on access without an untagged VLAN and on
+/// out-of-range VLAN ids.
+pub fn desired_vlan_rows(
+    mode: VlanModeInput,
+    untagged: Option<u32>,
+    tagged: &[u32],
+) -> std::result::Result<HashMap<u32, &'static str>, String> {
+    let mut rows = HashMap::new();
+    match mode {
+        VlanModeInput::Routed => {}
+        VlanModeInput::Access => {
+            let id = untagged.ok_or("access mode requires untagged_vlan")?;
+            rows.insert(check_vlan_id(id)?, "untagged");
+        }
+        VlanModeInput::Trunk => {
+            for &id in tagged {
+                rows.insert(check_vlan_id(id)?, "tagged");
+            }
+            // The native VLAN row wins if it also appears in tagged_vlans.
+            if let Some(id) = untagged {
+                rows.insert(check_vlan_id(id)?, "untagged");
+            }
+        }
+    }
+    Ok(rows)
+}
+
+/// Set-converge diff: (keys to delete, key/value pairs to write). Rows whose
+/// value already matches are left untouched; output is sorted so writes apply
+/// deterministically.
+pub fn diff_rows(
+    current: &HashMap<String, String>,
+    desired: &HashMap<String, String>,
+) -> (Vec<String>, Vec<(String, String)>) {
+    let mut dels: Vec<String> =
+        current.keys().filter(|k| !desired.contains_key(*k)).cloned().collect();
+    let mut sets: Vec<(String, String)> = desired
+        .iter()
+        .filter(|(k, v)| current.get(*k) != Some(*v))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    dels.sort();
+    sets.sort();
+    (dels, sets)
+}
+
+/// "PortChannel" + 1–4 digits — the LAG name shape SONiC's own CLI accepts.
+pub fn valid_port_channel_name(name: &str) -> bool {
+    name.strip_prefix("PortChannel")
+        .map(|d| !d.is_empty() && d.len() <= 4 && d.bytes().all(|b| b.is_ascii_digit()))
+        .unwrap_or(false)
+}
+
+/// 1..=4094, echoed back for insertion; the error is a 400 message.
+pub fn check_vlan_id(id: u32) -> std::result::Result<u32, String> {
+    if (1..=4094).contains(&id) {
+        Ok(id)
+    } else {
+        Err(format!("invalid VLAN id {id} (must be 1-4094)"))
+    }
+}
+
+/// Light CIDR sanity: enough shape to form a valid VLAN_INTERFACE key —
+/// address/prefix with no whitespace and no `|` (which would corrupt the key).
+pub fn check_cidrs(addrs: &[String]) -> std::result::Result<(), String> {
+    for a in addrs {
+        let ok = a.split_once('/').is_some_and(|(ip, len)| {
+            !ip.is_empty() && !len.is_empty() && len.bytes().all(|b| b.is_ascii_digit())
+        }) && !a.contains('|')
+            && !a.contains(char::is_whitespace);
+        if !ok {
+            return Err(format!("invalid CIDR address {a:?}"));
+        }
+    }
+    Ok(())
+}
+
+/// VLAN member list → name → tagging_mode map; duplicate names are a 400
+/// (two rows for one member can't both exist).
+pub fn vlan_member_map(
+    members: &[VlanMemberInput],
+) -> std::result::Result<HashMap<String, String>, String> {
+    let mut map = HashMap::new();
+    for m in members {
+        if map.insert(m.name.clone(), m.tagging.as_str().to_string()).is_some() {
+            return Err(format!("duplicate VLAN member {}", m.name));
+        }
+    }
+    Ok(map)
+}
+
+/// Port-channel member list, deduped-or-rejected.
+pub fn unique_members(members: &[String]) -> std::result::Result<Vec<String>, String> {
+    let mut seen = Vec::with_capacity(members.len());
+    for m in members {
+        if seen.contains(m) {
+            return Err(format!("duplicate member {m}"));
+        }
+        seen.push(m.clone());
+    }
+    Ok(seen)
+}
+
+fn check_mtu(v: u64) -> std::result::Result<(), String> {
+    if (68..=9216).contains(&v) {
+        Ok(())
+    } else {
+        Err(format!("invalid mtu {v} (must be 68-9216)"))
+    }
+}
+
+fn check_speed(v: u64) -> std::result::Result<(), String> {
+    if v > 0 {
+        Ok(())
+    } else {
+        Err("speed_mbps must be positive".to_string())
+    }
+}
+
+// ── redis write primitives ──────────────────────────────────────────────────
+
+fn hset(conn: &mut redis::Connection, key: &str, f: &str, v: &str) -> Result<()> {
+    redis::cmd("HSET")
+        .arg(key)
+        .arg(f)
+        .arg(v)
+        .query(conn)
+        .with_context(|| format!("HSET {key} {f}"))
+}
+
+fn hdel(conn: &mut redis::Connection, key: &str, f: &str) -> Result<()> {
+    redis::cmd("HDEL")
+        .arg(key)
+        .arg(f)
+        .query(conn)
+        .with_context(|| format!("HDEL {key} {f}"))
+}
+
+fn del(conn: &mut redis::Connection, key: &str) -> Result<()> {
+    redis::cmd("DEL").arg(key).query(conn).with_context(|| format!("DEL {key}"))
+}
+
+fn key_exists(conn: &mut redis::Connection, key: &str) -> Result<bool> {
+    let n: i64 = redis::cmd("EXISTS")
+        .arg(key)
+        .query(conn)
+        .with_context(|| format!("EXISTS {key}"))?;
+    Ok(n > 0)
+}
+
+/// Apply one tri-state patch field: Some(Some) → HSET, Some(None) → HDEL,
+/// None → untouched.
+fn apply_patch_field(
+    conn: &mut redis::Connection,
+    key: &str,
+    f: &str,
+    v: &Option<Option<String>>,
+) -> Result<()> {
+    match v {
+        Some(Some(v)) => hset(conn, key, f, v),
+        Some(None) => hdel(conn, key, f),
+        None => Ok(()),
+    }
+}
+
+// ── operations ──────────────────────────────────────────────────────────────
+
+/// `PUT /api/switching/ports/{name}` — patch scalar PORT fields and, when
+/// vlan_mode is present, converge the port's VLAN_MEMBER rows.
+pub fn update_port(name: &str, patch: &PortPatch) -> WriteResult {
+    // Everything checkable without redis is checked first, so a bad payload
+    // is a 400 even while redis is down.
+    if let Some(Some(v)) = patch.mtu {
+        check_mtu(v).map_err(bad)?;
+    }
+    if let Some(Some(v)) = patch.speed_mbps {
+        check_speed(v).map_err(bad)?;
+    }
+    let desired = match patch.vlan_mode {
+        Some(mode) => Some(
+            desired_vlan_rows(
+                mode,
+                patch.untagged_vlan.flatten(),
+                patch.tagged_vlans.as_deref().unwrap_or(&[]),
+            )
+            .map_err(bad)?,
+        ),
+        None => None,
+    };
+
+    let mut cfg = connection(CONFIG_DB)?;
+    let port_key = format!("PORT|{name}");
+    if !key_exists(&mut cfg, &port_key)? {
+        return Err(WriteError::NotFound(format!("no such port {name}")));
+    }
+    if let Some(rows) = &desired {
+        for id in rows.keys() {
+            if !key_exists(&mut cfg, &format!("VLAN|Vlan{id}"))? {
+                return Err(bad(format!("VLAN {id} does not exist")));
+            }
+        }
+    }
+
+    apply_patch_field(&mut cfg, &port_key, "description", &patch.description)?;
+    if let Some(v) = patch.admin_status {
+        hset(&mut cfg, &port_key, "admin_status", v.as_str())?;
+    }
+    match patch.mtu {
+        Some(Some(v)) => hset(&mut cfg, &port_key, "mtu", &v.to_string())?,
+        Some(None) => hdel(&mut cfg, &port_key, "mtu")?,
+        None => {}
+    }
+    match patch.speed_mbps {
+        Some(Some(v)) => hset(&mut cfg, &port_key, "speed", &v.to_string())?,
+        Some(None) => hdel(&mut cfg, &port_key, "speed")?,
+        None => {}
+    }
+    apply_patch_field(&mut cfg, &port_key, "fec", &patch.fec)?;
+
+    if let Some(rows) = desired {
+        // Current membership, keyed by vlan id (as a string for diff_rows).
+        let mut current = HashMap::new();
+        for key in scan_keys(&mut cfg, "VLAN_MEMBER|*")? {
+            let Some((vlan, member)) = member_parts(&key, "VLAN_MEMBER|") else { continue };
+            if member != name {
+                continue;
+            }
+            let Some(id) = vlan_id_from_name(vlan) else { continue };
+            let mode = field(&hgetall_on(&mut cfg, &key), "tagging_mode")
+                .unwrap_or("untagged")
+                .to_string();
+            current.insert(id.to_string(), mode);
+        }
+        let desired: HashMap<String, String> =
+            rows.into_iter().map(|(id, m)| (id.to_string(), m.to_string())).collect();
+        let (dels, sets) = diff_rows(&current, &desired);
+        for id in dels {
+            del(&mut cfg, &format!("VLAN_MEMBER|Vlan{id}|{name}"))?;
+        }
+        for (id, mode) in sets {
+            hset(&mut cfg, &format!("VLAN_MEMBER|Vlan{id}|{name}"), "tagging_mode", &mode)?;
+        }
+    }
+    Ok(())
+}
+
+/// Each VLAN member must be an existing port or port channel — a payload
+/// reference, so a miss is a 400 (404 is reserved for the path resource).
+fn check_members_exist(
+    cfg: &mut redis::Connection,
+    members: &HashMap<String, String>,
+) -> WriteResult {
+    for name in members.keys() {
+        if !key_exists(cfg, &format!("PORT|{name}"))?
+            && !key_exists(cfg, &format!("PORTCHANNEL|{name}"))?
+        {
+            return Err(bad(format!("no such interface {name}")));
+        }
+    }
+    Ok(())
+}
+
+/// `POST /api/switching/vlans`.
+pub fn create_vlan(vlan_id: u32, input: &VlanInput) -> WriteResult {
+    check_vlan_id(vlan_id).map_err(bad)?;
+    let members = vlan_member_map(&input.members).map_err(bad)?;
+    check_cidrs(&input.ip_addresses).map_err(bad)?;
+
+    let mut cfg = connection(CONFIG_DB)?;
+    let key = format!("VLAN|Vlan{vlan_id}");
+    if key_exists(&mut cfg, &key)? {
+        return Err(bad(format!("Vlan{vlan_id} already exists")));
+    }
+    check_members_exist(&mut cfg, &members)?;
+
+    hset(&mut cfg, &key, "vlanid", &vlan_id.to_string())?;
+    if let Some(d) = &input.description {
+        hset(&mut cfg, &key, "description", d)?;
+    }
+    if !input.dhcp_helpers.is_empty() {
+        hset(&mut cfg, &key, "dhcp_servers@", &input.dhcp_helpers.join(","))?;
+    }
+    for (name, tagging) in &members {
+        hset(&mut cfg, &format!("VLAN_MEMBER|Vlan{vlan_id}|{name}"), "tagging_mode", tagging)?;
+    }
+    if !input.ip_addresses.is_empty() {
+        // SONiC's intfmgrd only picks up the per-address child keys when the
+        // two-part parent row exists; NULL:NULL is the CLI's keyless-row idiom.
+        hset(&mut cfg, &format!("VLAN_INTERFACE|Vlan{vlan_id}"), "NULL", "NULL")?;
+        for cidr in &input.ip_addresses {
+            hset(&mut cfg, &format!("VLAN_INTERFACE|Vlan{vlan_id}|{cidr}"), "NULL", "NULL")?;
+        }
+    }
+    Ok(())
+}
+
+/// `PUT /api/switching/vlans/{vlan_id}` — converge description, members,
+/// addresses, and DHCP helpers to the given sets.
+pub fn update_vlan(vlan_id: u32, input: &VlanInput) -> WriteResult {
+    let members = vlan_member_map(&input.members).map_err(bad)?;
+    check_cidrs(&input.ip_addresses).map_err(bad)?;
+
+    let mut cfg = connection(CONFIG_DB)?;
+    let vlan = format!("Vlan{vlan_id}");
+    let key = format!("VLAN|{vlan}");
+    if !key_exists(&mut cfg, &key)? {
+        return Err(WriteError::NotFound(format!("no such VLAN {vlan}")));
+    }
+    check_members_exist(&mut cfg, &members)?;
+
+    match &input.description {
+        Some(d) => hset(&mut cfg, &key, "description", d)?,
+        None => hdel(&mut cfg, &key, "description")?,
+    }
+    if input.dhcp_helpers.is_empty() {
+        // Drop the plain-name variant too so the reader can't fall back to a
+        // stale list written by other tooling.
+        hdel(&mut cfg, &key, "dhcp_servers@")?;
+        hdel(&mut cfg, &key, "dhcp_servers")?;
+    } else {
+        hset(&mut cfg, &key, "dhcp_servers@", &input.dhcp_helpers.join(","))?;
+    }
+
+    let mut current = HashMap::new();
+    for k in scan_keys(&mut cfg, &format!("VLAN_MEMBER|{vlan}|*"))? {
+        if let Some((_, member)) = member_parts(&k, "VLAN_MEMBER|") {
+            let mode = field(&hgetall_on(&mut cfg, &k), "tagging_mode")
+                .unwrap_or("untagged")
+                .to_string();
+            current.insert(member.to_string(), mode);
+        }
+    }
+    let (dels, sets) = diff_rows(&current, &members);
+    for m in dels {
+        del(&mut cfg, &format!("VLAN_MEMBER|{vlan}|{m}"))?;
+    }
+    for (m, t) in sets {
+        hset(&mut cfg, &format!("VLAN_MEMBER|{vlan}|{m}"), "tagging_mode", &t)?;
+    }
+
+    let mut cur_ips = HashMap::new();
+    for k in scan_keys(&mut cfg, &format!("VLAN_INTERFACE|{vlan}|*"))? {
+        if let Some((_, cidr)) = member_parts(&k, "VLAN_INTERFACE|") {
+            cur_ips.insert(cidr.to_string(), String::new());
+        }
+    }
+    let want: HashMap<String, String> =
+        input.ip_addresses.iter().map(|c| (c.clone(), String::new())).collect();
+    let (dels, sets) = diff_rows(&cur_ips, &want);
+    for c in dels {
+        del(&mut cfg, &format!("VLAN_INTERFACE|{vlan}|{c}"))?;
+    }
+    if want.is_empty() {
+        del(&mut cfg, &format!("VLAN_INTERFACE|{vlan}"))?;
+    } else {
+        hset(&mut cfg, &format!("VLAN_INTERFACE|{vlan}"), "NULL", "NULL")?;
+        for (c, _) in sets {
+            hset(&mut cfg, &format!("VLAN_INTERFACE|{vlan}|{c}"), "NULL", "NULL")?;
+        }
+    }
+    Ok(())
+}
+
+/// `DELETE /api/switching/vlans/{vlan_id}` — the VLAN key plus every
+/// VLAN_MEMBER and VLAN_INTERFACE row that hangs off it.
+pub fn delete_vlan(vlan_id: u32) -> WriteResult {
+    let mut cfg = connection(CONFIG_DB)?;
+    let vlan = format!("Vlan{vlan_id}");
+    if !key_exists(&mut cfg, &format!("VLAN|{vlan}"))? {
+        return Err(WriteError::NotFound(format!("no such VLAN {vlan}")));
+    }
+    for k in scan_keys(&mut cfg, &format!("VLAN_MEMBER|{vlan}|*"))? {
+        del(&mut cfg, &k)?;
+    }
+    for k in scan_keys(&mut cfg, &format!("VLAN_INTERFACE|{vlan}|*"))? {
+        del(&mut cfg, &k)?;
+    }
+    del(&mut cfg, &format!("VLAN_INTERFACE|{vlan}"))?;
+    del(&mut cfg, &format!("VLAN|{vlan}"))?;
+    Ok(())
+}
+
+/// The PORTCHANNEL scalar fields shared by create and update. protocol maps
+/// to the `static` field ("true" for static, cleared for LACP); absent
+/// mtu/min_links clear theirs (the input is a full desired object).
+fn write_port_channel_fields(
+    cfg: &mut redis::Connection,
+    key: &str,
+    input: &PortChannelInput,
+) -> Result<()> {
+    hset(cfg, key, "admin_status", input.admin_status.as_str())?;
+    match input.protocol {
+        LagProtocol::Static => hset(cfg, key, "static", "true")?,
+        LagProtocol::Lacp => hdel(cfg, key, "static")?,
+    }
+    match input.mtu {
+        Some(v) => hset(cfg, key, "mtu", &v.to_string())?,
+        None => hdel(cfg, key, "mtu")?,
+    }
+    match input.min_links {
+        Some(v) => hset(cfg, key, "min_links", &v.to_string())?,
+        None => hdel(cfg, key, "min_links")?,
+    }
+    hset(cfg, key, "fallback", if input.fallback { "true" } else { "false" })?;
+    hset(cfg, key, "fast_rate", if input.fast_rate { "true" } else { "false" })
+}
+
+/// Payload-level port-channel validation shared by create and update.
+fn check_port_channel_input(input: &PortChannelInput) -> std::result::Result<Vec<String>, String> {
+    if let Some(v) = input.mtu {
+        check_mtu(v)?;
+    }
+    if input.min_links == Some(0) {
+        return Err("min_links must be positive".to_string());
+    }
+    unique_members(&input.members)
+}
+
+/// Port-channel members must be existing physical ports.
+fn check_ports_exist(cfg: &mut redis::Connection, members: &[String]) -> WriteResult {
+    for m in members {
+        if !key_exists(cfg, &format!("PORT|{m}"))? {
+            return Err(bad(format!("no such port {m}")));
+        }
+    }
+    Ok(())
+}
+
+/// `POST /api/switching/port-channels`.
+pub fn create_port_channel(name: &str, input: &PortChannelInput) -> WriteResult {
+    if !valid_port_channel_name(name) {
+        return Err(bad(format!(
+            "invalid port channel name {name:?} (expected PortChannel<1-4 digits>)"
+        )));
+    }
+    let members = check_port_channel_input(input).map_err(bad)?;
+
+    let mut cfg = connection(CONFIG_DB)?;
+    let key = format!("PORTCHANNEL|{name}");
+    if key_exists(&mut cfg, &key)? {
+        return Err(bad(format!("{name} already exists")));
+    }
+    check_ports_exist(&mut cfg, &members)?;
+
+    write_port_channel_fields(&mut cfg, &key, input)?;
+    for m in &members {
+        hset(&mut cfg, &format!("PORTCHANNEL_MEMBER|{name}|{m}"), "NULL", "NULL")?;
+    }
+    Ok(())
+}
+
+/// `PUT /api/switching/port-channels/{name}` — converge fields + member set.
+pub fn update_port_channel(name: &str, input: &PortChannelInput) -> WriteResult {
+    let members = check_port_channel_input(input).map_err(bad)?;
+
+    let mut cfg = connection(CONFIG_DB)?;
+    let key = format!("PORTCHANNEL|{name}");
+    if !key_exists(&mut cfg, &key)? {
+        return Err(WriteError::NotFound(format!("no such port channel {name}")));
+    }
+    check_ports_exist(&mut cfg, &members)?;
+
+    write_port_channel_fields(&mut cfg, &key, input)?;
+    let mut current = HashMap::new();
+    for k in scan_keys(&mut cfg, &format!("PORTCHANNEL_MEMBER|{name}|*"))? {
+        if let Some((_, port)) = member_parts(&k, "PORTCHANNEL_MEMBER|") {
+            current.insert(port.to_string(), String::new());
+        }
+    }
+    let want: HashMap<String, String> =
+        members.iter().map(|m| (m.clone(), String::new())).collect();
+    let (dels, sets) = diff_rows(&current, &want);
+    for m in dels {
+        del(&mut cfg, &format!("PORTCHANNEL_MEMBER|{name}|{m}"))?;
+    }
+    for (m, _) in sets {
+        hset(&mut cfg, &format!("PORTCHANNEL_MEMBER|{name}|{m}"), "NULL", "NULL")?;
+    }
+    Ok(())
+}
+
+/// `DELETE /api/switching/port-channels/{name}`.
+pub fn delete_port_channel(name: &str) -> WriteResult {
+    let mut cfg = connection(CONFIG_DB)?;
+    let key = format!("PORTCHANNEL|{name}");
+    if !key_exists(&mut cfg, &key)? {
+        return Err(WriteError::NotFound(format!("no such port channel {name}")));
+    }
+    for k in scan_keys(&mut cfg, &format!("PORTCHANNEL_MEMBER|{name}|*"))? {
+        del(&mut cfg, &k)?;
+    }
+    del(&mut cfg, &key)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -508,6 +1196,7 @@ mod tests {
                 ("mtu", "9100"),
             ]),
             &h(&[("oper_status", "up"), ("speed", "100000")]),
+            &h(&[("oper_status", "down"), ("speed", "50000")]),
             Some(&h(&[
                 ("SAI_PORT_STAT_IF_IN_ERRORS", "3"),
                 ("SAI_PORT_STAT_IF_OUT_ERRORS", "0"),
@@ -518,8 +1207,8 @@ mod tests {
         );
         assert_eq!(p.alias.as_deref(), Some("Eth1/1"));
         assert_eq!(p.admin_status, "up");
+        // APPL_DB oper/speed win over STATE_DB and CONFIG_DB.
         assert_eq!(p.oper_status, "up");
-        // STATE_DB speed wins over the CONFIG_DB one.
         assert_eq!(p.speed_mbps, Some(100_000));
         assert_eq!(p.mtu, Some(9100));
         assert_eq!(p.vlan_mode, Some("trunk"));
@@ -531,7 +1220,8 @@ mod tests {
 
     #[test]
     fn port_degrades_field_by_field() {
-        let p = port_from("Ethernet4", &HashMap::new(), &HashMap::new(), None, &[]);
+        let p =
+            port_from("Ethernet4", &HashMap::new(), &HashMap::new(), &HashMap::new(), None, &[]);
         assert_eq!(p.admin_status, "down"); // SONiC default
         assert_eq!(p.oper_status, "unknown");
         assert_eq!(p.speed_mbps, None);
@@ -541,10 +1231,11 @@ mod tests {
         // No counters entry → null, not zero.
         assert_eq!(p.rx_err, None);
         assert_eq!(p.tx_err, None);
-        // CONFIG_DB speed used when STATE_DB has none; garbage numbers → null.
+        // CONFIG_DB speed used when APPL_DB/STATE_DB have none; garbage → null.
         let p = port_from(
             "Ethernet8",
             &h(&[("speed", "25000"), ("mtu", "jumbo")]),
+            &HashMap::new(),
             &HashMap::new(),
             Some(&h(&[("SAI_PORT_STAT_IF_IN_ERRORS", "2")])),
             &[],
@@ -557,9 +1248,33 @@ mod tests {
     }
 
     #[test]
+    fn oper_status_prefers_appl_db_then_state_db() {
+        // APPL_DB is the authority — the STATE_DB row (transceiver/init
+        // state on most platforms) only breaks an APPL_DB miss.
+        assert_eq!(oper_status_of(&h(&[("oper_status", "up")]), &HashMap::new()), "up");
+        assert_eq!(
+            oper_status_of(&h(&[("oper_status", "down")]), &h(&[("oper_status", "up")])),
+            "down"
+        );
+        assert_eq!(oper_status_of(&HashMap::new(), &h(&[("oper_status", "up")])), "up");
+        assert_eq!(oper_status_of(&HashMap::new(), &HashMap::new()), "unknown");
+        // STATE_DB speed still wins over CONFIG_DB when APPL_DB has none.
+        let p = port_from(
+            "Ethernet0",
+            &h(&[("speed", "40000")]),
+            &HashMap::new(),
+            &h(&[("speed", "100000")]),
+            None,
+            &[],
+        );
+        assert_eq!(p.speed_mbps, Some(100_000));
+    }
+
+    #[test]
     fn port_serializes_to_the_contract_shape() {
         let v = serde_json::to_value(port_from(
             "Ethernet4",
+            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             None,
@@ -615,5 +1330,148 @@ mod tests {
             member_parts("VLAN_INTERFACE|Vlan10|10.0.10.1/24", "VLAN_INTERFACE|"),
             Some(("Vlan10", "10.0.10.1/24"))
         );
+    }
+
+    // ── write helpers ───────────────────────────────────────────────────────
+
+    #[test]
+    fn port_patch_distinguishes_omitted_from_null() {
+        let p: PortPatch = parse_json(b"{}").unwrap();
+        assert_eq!(p, PortPatch::default());
+        let p: PortPatch =
+            parse_json(br#"{"mtu": null, "speed_mbps": 100000, "description": null}"#).unwrap();
+        assert_eq!(p.mtu, Some(None)); // null → clear
+        assert_eq!(p.speed_mbps, Some(Some(100_000)));
+        assert_eq!(p.description, Some(None));
+        assert_eq!(p.fec, None); // omitted → untouched
+        let p: PortPatch =
+            parse_json(br#"{"admin_status": "down", "vlan_mode": "trunk", "tagged_vlans": [10]}"#)
+                .unwrap();
+        assert_eq!(p.admin_status, Some(AdminStatus::Down));
+        assert_eq!(p.vlan_mode, Some(VlanModeInput::Trunk));
+        assert_eq!(p.tagged_vlans, Some(vec![10]));
+    }
+
+    #[test]
+    fn port_patch_rejects_bad_enums_and_bodies() {
+        assert!(parse_json::<PortPatch>(br#"{"admin_status": "sideways"}"#).is_err());
+        assert!(parse_json::<PortPatch>(br#"{"vlan_mode": "hybrid"}"#).is_err());
+        assert!(parse_json::<PortPatch>(b"not json").is_err());
+        assert!(parse_json::<PortPatch>(br#"{"mtu": -1}"#).is_err());
+    }
+
+    #[test]
+    fn vlan_create_parses_with_flattened_input() {
+        let c: VlanCreate = parse_json(
+            br#"{"vlan_id": 20, "description": "users",
+                 "ip_addresses": ["10.0.20.1/24"], "dhcp_helpers": ["10.0.0.5"],
+                 "members": [{"name": "Ethernet0", "tagging": "untagged"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(c.vlan_id, 20);
+        assert_eq!(c.input.description.as_deref(), Some("users"));
+        assert_eq!(c.input.ip_addresses, vec!["10.0.20.1/24"]);
+        assert_eq!(c.input.members[0].tagging, Tagging::Untagged);
+        // Lists default to empty when omitted.
+        let c: VlanCreate = parse_json(br#"{"vlan_id": 30}"#).unwrap();
+        assert!(c.input.members.is_empty() && c.input.ip_addresses.is_empty());
+    }
+
+    #[test]
+    fn port_channel_create_parses_with_flattened_input() {
+        let c: PortChannelCreate = parse_json(
+            br#"{"name": "PortChannel0001", "protocol": "lacp", "admin_status": "up",
+                 "mtu": 9100, "min_links": 2, "fallback": true, "fast_rate": false,
+                 "members": ["Ethernet0", "Ethernet4"]}"#,
+        )
+        .unwrap();
+        assert_eq!(c.name, "PortChannel0001");
+        assert_eq!(c.input.protocol, LagProtocol::Lacp);
+        assert_eq!(c.input.mtu, Some(9100));
+        assert!(c.input.fallback && !c.input.fast_rate);
+        assert_eq!(c.input.members, vec!["Ethernet0", "Ethernet4"]);
+        assert!(parse_json::<PortChannelCreate>(br#"{"name": "Po1", "protocol": "pagp"}"#).is_err());
+    }
+
+    #[test]
+    fn desired_vlan_rows_cover_the_three_modes() {
+        assert!(desired_vlan_rows(VlanModeInput::Routed, Some(10), &[20]).unwrap().is_empty());
+        let access = desired_vlan_rows(VlanModeInput::Access, Some(10), &[]).unwrap();
+        assert_eq!(access.get(&10), Some(&"untagged"));
+        assert_eq!(access.len(), 1);
+        let trunk = desired_vlan_rows(VlanModeInput::Trunk, Some(10), &[20, 30]).unwrap();
+        assert_eq!(trunk.get(&10), Some(&"untagged"));
+        assert_eq!(trunk.get(&20), Some(&"tagged"));
+        assert_eq!(trunk.get(&30), Some(&"tagged"));
+        // Native VLAN wins when listed in tagged_vlans too.
+        let trunk = desired_vlan_rows(VlanModeInput::Trunk, Some(10), &[10]).unwrap();
+        assert_eq!(trunk.get(&10), Some(&"untagged"));
+        // Trunk without a native VLAN is fine.
+        assert_eq!(desired_vlan_rows(VlanModeInput::Trunk, None, &[20]).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn desired_vlan_rows_reject_invalid_input() {
+        assert!(desired_vlan_rows(VlanModeInput::Access, None, &[]).is_err());
+        assert!(desired_vlan_rows(VlanModeInput::Access, Some(0), &[]).is_err());
+        assert!(desired_vlan_rows(VlanModeInput::Trunk, None, &[4095]).is_err());
+    }
+
+    #[test]
+    fn diff_rows_converges_without_touching_unchanged() {
+        let current = h(&[("10", "untagged"), ("20", "tagged"), ("30", "tagged")]);
+        let desired = h(&[("10", "untagged"), ("20", "untagged"), ("40", "tagged")]);
+        let (dels, sets) = diff_rows(&current, &desired);
+        assert_eq!(dels, vec!["30"]); // gone from desired
+        // 10 unchanged → untouched; 20 retagged and 40 new → written.
+        assert_eq!(
+            sets,
+            vec![("20".into(), "untagged".into()), ("40".into(), "tagged".into())]
+        );
+        let (dels, sets) = diff_rows(&current, &current);
+        assert!(dels.is_empty() && sets.is_empty());
+    }
+
+    #[test]
+    fn port_channel_names_validate_sonics_shape() {
+        assert!(valid_port_channel_name("PortChannel0001"));
+        assert!(valid_port_channel_name("PortChannel1"));
+        assert!(valid_port_channel_name("PortChannel9999"));
+        assert!(!valid_port_channel_name("PortChannel"));
+        assert!(!valid_port_channel_name("PortChannel10000"));
+        assert!(!valid_port_channel_name("PortChannel00a1"));
+        assert!(!valid_port_channel_name("Po1"));
+        assert!(!valid_port_channel_name("portchannel0001"));
+    }
+
+    #[test]
+    fn vlan_ids_and_cidrs_validate() {
+        assert!(check_vlan_id(1).is_ok() && check_vlan_id(4094).is_ok());
+        assert!(check_vlan_id(0).is_err() && check_vlan_id(4095).is_err());
+        assert!(check_cidrs(&["10.0.10.1/24".into(), "fd00::1/64".into()]).is_ok());
+        assert!(check_cidrs(&[]).is_ok());
+        assert!(check_cidrs(&["10.0.10.1".into()]).is_err()); // no prefix
+        assert!(check_cidrs(&["10.0.10.1/24 ".into()]).is_err()); // whitespace
+        assert!(check_cidrs(&["10.0.10.1/x".into()]).is_err());
+        assert!(check_cidrs(&["a|b/24".into()]).is_err()); // would corrupt the key
+    }
+
+    #[test]
+    fn member_lists_reject_duplicates() {
+        let m = |name: &str, tagging| VlanMemberInput { name: name.into(), tagging };
+        let map = vlan_member_map(&[
+            m("Ethernet0", Tagging::Untagged),
+            m("PortChannel0001", Tagging::Tagged),
+        ])
+        .unwrap();
+        assert_eq!(map.get("Ethernet0").map(String::as_str), Some("untagged"));
+        assert_eq!(map.get("PortChannel0001").map(String::as_str), Some("tagged"));
+        assert!(vlan_member_map(&[m("Ethernet0", Tagging::Untagged), m("Ethernet0", Tagging::Tagged)])
+            .is_err());
+        assert_eq!(
+            unique_members(&["Ethernet0".into(), "Ethernet4".into()]).unwrap().len(),
+            2
+        );
+        assert!(unique_members(&["Ethernet0".into(), "Ethernet0".into()]).is_err());
     }
 }
