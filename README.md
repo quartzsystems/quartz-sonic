@@ -2,7 +2,7 @@
 
 Quartz Command fleet-management agent for SONiC switches — the SONiC
 counterpart to the QuartzFire firewall agent. It enrolls a switch into
-[Quartz Command](https://github.com/zagdrath/quartz-command) and maintains a
+[Quartz Command](https://github.com/quartzsystems/quartz-command) and maintains a
 persistent mTLS control channel so the console can monitor and manage the
 switch. Ships as a single static `.deb` that installs on both community SONiC
 and Enterprise SONiC.
@@ -12,7 +12,7 @@ and Enterprise SONiC.
 One-liner, on the switch (amd64):
 
 ```
-curl -fsSL https://raw.githubusercontent.com/zagdrath/quartz-sonic/main/scripts/install.sh | sudo sh
+curl -fsSL https://raw.githubusercontent.com/quartzsystems/quartz-sonic/main/scripts/install.sh | sudo sh
 ```
 
 The same command **updates** an installed agent: the script always fetches
@@ -20,7 +20,7 @@ the latest release, `dpkg -i` upgrades in place, and the package restarts
 `quartz-sonic.service` after the upgrade — enrollment state and identity in
 `/var/lib/quartz-sonic/` are untouched, so the switch reconnects as itself.
 (To skip the script, the package itself is at
-`https://github.com/zagdrath/quartz-sonic/releases/latest/download/quartz-sonic_amd64.deb`.)
+`https://github.com/quartzsystems/quartz-sonic/releases/latest/download/quartz-sonic_amd64.deb`.)
 
 ## Enrolling a switch
 

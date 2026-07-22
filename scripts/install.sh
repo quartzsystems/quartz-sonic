@@ -1,7 +1,7 @@
 #!/bin/sh
 # quartz-sonic installer/updater for SONiC switches.
 #
-#   curl -fsSL https://raw.githubusercontent.com/zagdrath/quartz-sonic/main/scripts/install.sh | sudo sh
+#   curl -fsSL https://raw.githubusercontent.com/quartzsystems/quartz-sonic/main/scripts/install.sh | sudo sh
 #
 # Fetches the latest released .deb and installs it with dpkg. Running it on a
 # box that already has quartz-sonic upgrades in place: enrollment state and
@@ -9,7 +9,7 @@
 # after the upgrade, so the switch reconnects as itself.
 set -eu
 
-REPO="zagdrath/quartz-sonic"
+REPO="quartzsystems/quartz-sonic"
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "quartz-sonic install: must run as root — pipe to 'sudo sh'" >&2

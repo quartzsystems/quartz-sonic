@@ -5,7 +5,7 @@ version = "0.1.0"
 edition = "2021"
 license = "GPL-2.0-or-later"
 authors = ["Quartz Systems <cwellman@quartz.systems>"]
-repository = "https://github.com/zagdrath/quartz-sonic"
+repository = "https://github.com/quartzsystems/quartz-sonic"
 
 [[bin]]
 name = "quartz-sonic"
