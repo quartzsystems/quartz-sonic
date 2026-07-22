@@ -356,6 +356,18 @@ pub fn vlan_id_from_name(name: &str) -> Option<u32> {
     name.strip_prefix("Vlan")?.parse().ok()
 }
 
+/// Sorted, deduplicated VLAN ids out of CONFIG_DB `VLAN|VlanN` keys.
+pub fn key_id_sorted_vlans(keys: &[String]) -> Vec<u32> {
+    let mut ids: Vec<u32> = keys
+        .iter()
+        .filter_map(|k| k.strip_prefix("VLAN|"))
+        .filter_map(vlan_id_from_name)
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
 // ── shared helpers ──────────────────────────────────────────────────────────
 
 /// Order interface names naturally: digit runs compare by numeric value,
@@ -486,6 +498,12 @@ pub enum WriteError {
     BadRequest(String),
     NotFound(String),
     Unprocessable(String),
+    /// The switch's current state refuses the operation (feature unsupported
+    /// on this image, resource still in use, port not actually guard-shut…).
+    Conflict(String),
+    /// A non-redis platform failure (vtysh/config invocation) — 500 with the
+    /// message as-is.
+    Internal(String),
     Redis(anyhow::Error),
 }
 
@@ -495,7 +513,7 @@ impl From<anyhow::Error> for WriteError {
     }
 }
 
-type WriteResult = std::result::Result<(), WriteError>;
+pub type WriteResult = std::result::Result<(), WriteError>;
 
 fn bad(msg: impl Into<String>) -> WriteError {
     WriteError::BadRequest(msg.into())
@@ -508,7 +526,7 @@ pub fn parse_json<T: serde::de::DeserializeOwned>(body: &[u8]) -> std::result::R
 
 /// Deserialize a present field as Some(inner) so a handler can distinguish
 /// omitted (None — leave untouched) from null (Some(None) — clear).
-fn present<'de, T, D>(d: D) -> std::result::Result<Option<Option<T>>, D::Error>
+pub fn present<'de, T, D>(d: D) -> std::result::Result<Option<Option<T>>, D::Error>
 where
     T: Deserialize<'de>,
     D: Deserializer<'de>,
@@ -524,7 +542,7 @@ pub enum AdminStatus {
 }
 
 impl AdminStatus {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             AdminStatus::Up => "up",
             AdminStatus::Down => "down",
