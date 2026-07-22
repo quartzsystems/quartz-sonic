@@ -76,7 +76,8 @@ copyright = "2026, Quartz Systems"
 extended-description = """\
 Enrolls a SONiC switch into Quartz Command and maintains a persistent mTLS
 control channel so the console can monitor and manage the switch. Ships the
-enroll/status CLI and the quartz-sonic.service daemon in one static binary."""
+enroll/unenroll/status CLI and the quartz-sonic.service daemon in one static
+binary."""
 section = "net"
 priority = "optional"
 # Static musl binary — no runtime library dependencies.

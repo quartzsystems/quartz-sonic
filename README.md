@@ -44,6 +44,33 @@ quartz-sonic status
 
 An adopted device cannot re-enroll until it is revoked in the console.
 
+## Unenrolling a switch
+
+```
+sudo quartz-sonic unenroll
+```
+
+deletes the certificates and enrollment state and restarts the daemon, which
+then idles unenrolled. This is **local only** — the fleet protocol has no
+unenroll RPC — so also revoke/remove the device in the Quartz Command
+console; until then it stays listed (offline) and its issued certificate
+remains valid. The device keypair is kept, so a later `enroll` reconnects
+under the same device ID; add `--wipe-identity` to delete the keypair too and
+get a brand-new device ID on the next enrollment.
+
+## Uninstalling
+
+```
+curl -fsSL https://raw.githubusercontent.com/quartzsystems/quartz-sonic/main/scripts/uninstall.sh | sudo sh
+```
+
+stops and disables the service, purges the package, and removes all local
+state (`/var/lib/quartz-sonic`, `/etc/quartz-sonic`, `/run/quartz-sonic`).
+Append `-s -- --keep-state` to keep `/var/lib/quartz-sonic` so a later
+reinstall reconnects as the same enrolled switch. Uninstalling does not
+notify the controller either — unenroll first or revoke the device in the
+console.
+
 ## What the daemon does
 
 `quartz-sonic.service` (installed enabled, `Restart=always`) connects to the
@@ -69,7 +96,7 @@ Logs go to journald: `journalctl -u quartz-sonic`.
 
 | path                        | content                                  |
 |-----------------------------|------------------------------------------|
-| `/usr/bin/quartz-sonic`     | single binary: `enroll`, `status`, `run` |
+| `/usr/bin/quartz-sonic`     | single binary: `enroll`, `unenroll`, `status`, `run` |
 | `/var/lib/quartz-sonic/`    | identity, certificates, state (0700)     |
 | `/etc/quartz-sonic/`        | reserved for config (none needed yet)    |
 | `/run/quartz-sonic/status.json` | live status for `quartz-sonic status` |

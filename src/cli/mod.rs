@@ -1,8 +1,12 @@
 //! The CLI entry points other than the daemon itself:
 //!
 //!   enroll <TOKEN>  — one-shot enrollment against the token's gateway
+//!   unenroll        — clear local enrollment (certs + state); console-side
+//!                     revocation is still the operator's job
 //!   status          — device ID, enrollment state, gateway, cert expiry,
 //!                     stream connectivity
+
+use std::path::Path;
 
 use anyhow::{Context, Result};
 
@@ -105,6 +109,86 @@ fn enroll_inner(raw_token: &str, force: bool) -> Result<()> {
     Ok(())
 }
 
+// ── unenroll ──────────────────────────────────────────────────────────────────
+
+/// `quartz-sonic unenroll [--wipe-identity]`. Local-only: there is no
+/// unenroll RPC in the fleet protocol, so this deletes the enrollment state
+/// and certificates and restarts the daemon into its unenrolled park. The
+/// issued client certificate stays valid until the operator revokes the
+/// device in the QuartzCommand console.
+pub fn unenroll_cmd(wipe_identity: bool) -> i32 {
+    match unenroll_inner(wipe_identity) {
+        Ok(()) => 0,
+        Err(e) => {
+            log(&format!("{e:#}"));
+            1
+        }
+    }
+}
+
+fn unenroll_inner(wipe_identity: bool) -> Result<()> {
+    let store = IdentityStore::new(state::identity_dir());
+    let st = EnrollmentState::load(&state::state_file())?;
+
+    if !st.enrolled && !wipe_identity {
+        log("not enrolled — nothing to do");
+        return Ok(());
+    }
+    if st.enrolled {
+        log(&format!(
+            "unenrolling {} (org {})",
+            st.device_id.as_deref().unwrap_or("?"),
+            st.org_id.as_deref().unwrap_or("?")
+        ));
+    }
+
+    remove_enrollment_files(&store, &state::state_file(), wipe_identity)?;
+    if wipe_identity {
+        log("device identity wiped — the next enrollment gets a new device ID");
+    }
+
+    let restarted = std::process::Command::new("systemctl")
+        .args(["try-restart", "quartz-sonic.service"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if restarted {
+        log("quartz-sonic.service restarted — the switch is disconnected");
+    }
+
+    log(
+        "local enrollment cleared. The controller was NOT notified: also \
+         revoke/remove this device in the QuartzCommand console, or it stays \
+         listed (offline) with a still-valid certificate.",
+    );
+    Ok(())
+}
+
+fn remove_enrollment_files(
+    store: &IdentityStore,
+    state_file: &Path,
+    wipe_identity: bool,
+) -> Result<()> {
+    remove(state_file)?;
+    remove(&store.client_cert_path())?;
+    remove(&store.ca_chain_path())?;
+    remove(&store.pinned_ca_path())?;
+    if wipe_identity {
+        remove(&store.key_path())?;
+        remove(&store.pub_path())?;
+    }
+    Ok(())
+}
+
+fn remove(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e)
+            .with_context(|| format!("remove {} (are you running as root?)", path.display())),
+    }
+}
+
 // ── status ────────────────────────────────────────────────────────────────────
 
 pub fn status(json: bool) -> i32 {
@@ -198,6 +282,30 @@ fn format_unix(unix: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unenroll_keeps_identity_unless_wiped() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = IdentityStore::new(dir.path());
+        store.load_or_generate().unwrap();
+        store.save_certificates(b"cert", &[b"ca".to_vec()], Some(b"pin")).unwrap();
+        let state_file = dir.path().join("state.json");
+        EnrollmentState { enrolled: true, ..Default::default() }.save(&state_file).unwrap();
+
+        remove_enrollment_files(&store, &state_file, false).unwrap();
+        assert!(!state_file.exists());
+        assert!(!store.client_cert_path().exists());
+        assert!(!store.ca_chain_path().exists());
+        assert!(!store.pinned_ca_path().exists());
+        // Keypair survives: the device re-enrolls under the same device ID.
+        assert!(store.key_path().exists());
+        assert!(store.pub_path().exists());
+
+        // Second run is a no-op, not an error; --wipe-identity takes the key.
+        remove_enrollment_files(&store, &state_file, true).unwrap();
+        assert!(!store.key_path().exists());
+        assert!(!store.pub_path().exists());
+    }
 
     #[test]
     fn unix_formatting() {

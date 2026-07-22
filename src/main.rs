@@ -3,6 +3,7 @@
 //! One binary at /usr/bin/quartz-sonic:
 //!
 //!   enroll '<TOKEN>'  — enroll this switch into Quartz Command
+//!   unenroll          — clear local enrollment (certs + state)
 //!   status [--json]   — device ID, enrollment, gateway, cert, connectivity
 //!   run               — the daemon (quartz-sonic.service's entry point)
 
@@ -47,6 +48,15 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Unenroll this switch locally: delete its certificates and enrollment
+    /// state and disconnect. The controller is not notified — also
+    /// revoke/remove the device in the Quartz Command console.
+    Unenroll {
+        /// Also delete the device keypair, so the next enrollment gets a
+        /// brand-new device ID.
+        #[arg(long)]
+        wipe_identity: bool,
+    },
     /// Show enrollment / control-channel status.
     Status {
         /// Machine-readable output.
@@ -70,6 +80,7 @@ fn main() {
     let args = Cli::parse();
     let code = match args.command {
         Command::Enroll { token, force } => cli::enroll_cmd(&token, force),
+        Command::Unenroll { wipe_identity } => cli::unenroll_cmd(wipe_identity),
         Command::Status { json } => cli::status(json),
         Command::Run => match control::daemon::run() {
             Ok(()) => 0,
