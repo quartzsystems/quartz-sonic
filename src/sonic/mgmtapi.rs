@@ -310,8 +310,8 @@ where
 }
 
 /// Map a write op's outcome to the contract: 200 {"ok": true} (after a
-/// best-effort `config save -y`), 400/404 with {"error": …}, or the readers'
-/// 500 shape when redis itself failed.
+/// best-effort `config save -y`), 400/404/422 with {"error": …}, or the
+/// readers' 500 shape when redis itself failed.
 fn write_outcome(r: Result<(), WriteError>) -> CallResult {
     match r {
         Ok(()) => {
@@ -320,6 +320,7 @@ fn write_outcome(r: Result<(), WriteError>) -> CallResult {
         }
         Err(WriteError::BadRequest(msg)) => error_response(400, msg),
         Err(WriteError::NotFound(msg)) => error_response(404, msg),
+        Err(WriteError::Unprocessable(msg)) => error_response(422, msg),
         Err(WriteError::Redis(e)) => redis_unreachable(&e),
     }
 }

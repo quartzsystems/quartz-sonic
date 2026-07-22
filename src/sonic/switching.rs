@@ -17,8 +17,9 @@
 //! The write operations converge CONFIG_DB toward the request's desired
 //! state: lists in a payload are full sets, diffed against the current rows
 //! so unchanged rows are never touched. Validation failures surface as
-//! [`WriteError::BadRequest`]/[`WriteError::NotFound`] before anything is
-//! written. All redis access runs inside the management API's spawn_blocking.
+//! [`WriteError::BadRequest`]/[`WriteError::NotFound`]/
+//! [`WriteError::Unprocessable`] before anything is written. All redis access
+//! runs inside the management API's spawn_blocking.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -40,6 +41,10 @@ pub struct Port {
     pub admin_status: String,
     pub oper_status: String,
     pub speed_mbps: Option<u64>,
+    /// Speeds the platform/SDK reports the port can run, from STATE_DB
+    /// `supported_speeds`. None (→ JSON null, never []) when unpublished so
+    /// the console falls back to its generic speed ladder.
+    pub supported_speeds: Option<Vec<u64>>,
     pub fec: Option<String>,
     pub mtu: Option<u64>,
     pub vlan_mode: Option<&'static str>,
@@ -106,6 +111,7 @@ pub fn port_from(
         speed_mbps: parse_num(field(appl, "speed"))
             .or_else(|| parse_num(field(state, "speed")))
             .or_else(|| parse_num(field(cfg, "speed"))),
+        supported_speeds: parse_supported_speeds(field(state, "supported_speeds")),
         fec: field(cfg, "fec").map(str::to_string),
         mtu: parse_num(field(cfg, "mtu")),
         vlan_mode,
@@ -393,6 +399,25 @@ pub fn parse_num(v: Option<&str>) -> Option<u64> {
     v?.parse().ok()
 }
 
+/// STATE_DB's `supported_speeds` — SONiC publishes a comma-separated Mbps
+/// string (e.g. "10000,25000,40000,100000"). Sorted and deduplicated;
+/// malformed (and zero) entries are skipped. None when the field is absent or
+/// nothing usable remains — the contract emits null, never [], so the console
+/// can fall back to its generic speed ladder.
+pub fn parse_supported_speeds(v: Option<&str>) -> Option<Vec<u64>> {
+    let mut speeds: Vec<u64> = v?
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .filter(|&n| n > 0)
+        .collect();
+    if speeds.is_empty() {
+        return None;
+    }
+    speeds.sort_unstable();
+    speeds.dedup();
+    Some(speeds)
+}
+
 /// Boolean CONFIG_DB values ("true"/"false", any case); None on anything else.
 pub fn parse_bool(v: Option<&str>) -> Option<bool> {
     match v?.to_ascii_lowercase().as_str() {
@@ -454,11 +479,13 @@ fn member_oper(
 
 /// How a switching write fails. The management API maps these onto the HTTP
 /// statuses the console expects: invalid payloads → 400, unknown resources →
-/// 404, and an unreachable/failed redis → the existing 500 shape.
+/// 404, well-formed values the hardware can't take → 422, and an
+/// unreachable/failed redis → the existing 500 shape.
 #[derive(Debug)]
 pub enum WriteError {
     BadRequest(String),
     NotFound(String),
+    Unprocessable(String),
     Redis(anyhow::Error),
 }
 
@@ -728,6 +755,22 @@ fn check_speed(v: u64) -> std::result::Result<(), String> {
     }
 }
 
+/// A speed the platform says the port can't run is a 422. None (STATE_DB
+/// didn't publish supported_speeds) accepts anything — best-effort, as
+/// before the field existed.
+pub fn check_supported_speed(
+    speed: u64,
+    supported: Option<&[u64]>,
+) -> std::result::Result<(), String> {
+    match supported {
+        Some(list) if !list.contains(&speed) => Err(format!(
+            "unsupported speed {speed} (supported: {})",
+            list.iter().map(u64::to_string).collect::<Vec<_>>().join(", ")
+        )),
+        _ => Ok(()),
+    }
+}
+
 // ── redis write primitives ──────────────────────────────────────────────────
 
 fn hset(conn: &mut redis::Connection, key: &str, f: &str, v: &str) -> Result<()> {
@@ -803,6 +846,14 @@ pub fn update_port(name: &str, patch: &PortPatch) -> WriteResult {
     let port_key = format!("PORT|{name}");
     if !key_exists(&mut cfg, &port_key)? {
         return Err(WriteError::NotFound(format!("no such port {name}")));
+    }
+    if let Some(Some(v)) = patch.speed_mbps {
+        // STATE_DB unreachable or silent on supported_speeds → accept the
+        // value as before (best-effort); a published list is enforced.
+        let mut state = connection(STATE_DB).ok();
+        let row = state_row(&mut state, &format!("PORT_TABLE|{name}"));
+        let supported = parse_supported_speeds(field(&row, "supported_speeds"));
+        check_supported_speed(v, supported.as_deref()).map_err(WriteError::Unprocessable)?;
     }
     if let Some(rows) = &desired {
         for id in rows.keys() {
@@ -1176,6 +1227,33 @@ mod tests {
     }
 
     #[test]
+    fn supported_speeds_parse_sorted_deduped_and_defensively() {
+        assert_eq!(
+            parse_supported_speeds(Some("100000,40000,10000,25000")),
+            Some(vec![10_000, 25_000, 40_000, 100_000])
+        );
+        // Duplicates collapse; whitespace and malformed entries are skipped.
+        assert_eq!(
+            parse_supported_speeds(Some(" 25000 ,10000,25000,fast,0")),
+            Some(vec![10_000, 25_000])
+        );
+        // Absent or nothing usable → None (the contract's null, never []).
+        assert_eq!(parse_supported_speeds(None), None);
+        assert_eq!(parse_supported_speeds(Some("")), None);
+        assert_eq!(parse_supported_speeds(Some("N/A,,")), None);
+    }
+
+    #[test]
+    fn supported_speed_check_enforces_published_lists_only() {
+        assert!(check_supported_speed(25_000, Some(&[10_000, 25_000])).is_ok());
+        let err = check_supported_speed(40_000, Some(&[10_000, 25_000])).unwrap_err();
+        assert!(err.contains("unsupported speed 40000"), "{err}");
+        assert!(err.contains("10000, 25000"), "{err}");
+        // No published list → best-effort, accept anything.
+        assert!(check_supported_speed(40_000, None).is_ok());
+    }
+
+    #[test]
     fn boolean_strings_parse_defensively() {
         assert_eq!(parse_bool(Some("true")), Some(true));
         assert_eq!(parse_bool(Some("False")), Some(false));
@@ -1196,7 +1274,11 @@ mod tests {
                 ("mtu", "9100"),
             ]),
             &h(&[("oper_status", "up"), ("speed", "100000")]),
-            &h(&[("oper_status", "down"), ("speed", "50000")]),
+            &h(&[
+                ("oper_status", "down"),
+                ("speed", "50000"),
+                ("supported_speeds", "100000,40000,10000,25000"),
+            ]),
             Some(&h(&[
                 ("SAI_PORT_STAT_IF_IN_ERRORS", "3"),
                 ("SAI_PORT_STAT_IF_OUT_ERRORS", "0"),
@@ -1210,6 +1292,8 @@ mod tests {
         // APPL_DB oper/speed win over STATE_DB and CONFIG_DB.
         assert_eq!(p.oper_status, "up");
         assert_eq!(p.speed_mbps, Some(100_000));
+        // supported_speeds comes from STATE_DB, sorted.
+        assert_eq!(p.supported_speeds, Some(vec![10_000, 25_000, 40_000, 100_000]));
         assert_eq!(p.mtu, Some(9100));
         assert_eq!(p.vlan_mode, Some("trunk"));
         assert_eq!(p.untagged_vlan, Some(10));
@@ -1225,6 +1309,7 @@ mod tests {
         assert_eq!(p.admin_status, "down"); // SONiC default
         assert_eq!(p.oper_status, "unknown");
         assert_eq!(p.speed_mbps, None);
+        assert_eq!(p.supported_speeds, None);
         assert_eq!(p.alias, None);
         assert_eq!(p.mtu, None);
         assert_eq!(p.vlan_mode, Some("routed"));
@@ -1284,6 +1369,8 @@ mod tests {
         assert_eq!(v["name"], "Ethernet4");
         assert!(v["alias"].is_null());
         assert!(v["speed_mbps"].is_null());
+        // Unpublished supported_speeds must serialize as null, never [].
+        assert!(v["supported_speeds"].is_null());
         assert!(v["rx_err"].is_null());
         assert_eq!(v["vlan_mode"], "routed");
         assert_eq!(v["tagged_vlans"], serde_json::json!([]));
