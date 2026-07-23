@@ -229,6 +229,11 @@ pub fn feature_lock(feature: &str) -> MutexGuard<'static, ()> {
     static SYSTEM: Mutex<()> = Mutex::new(());
     static ACL: Mutex<()> = Mutex::new(());
     static AAA: Mutex<()> = Mutex::new(());
+    static MIRROR: Mutex<()> = Mutex::new(());
+    static STORM_CONTROL: Mutex<()> = Mutex::new(());
+    static FDB: Mutex<()> = Mutex::new(());
+    static DHCP_RELAY: Mutex<()> = Mutex::new(());
+    static SFLOW: Mutex<()> = Mutex::new(());
     static MISC: Mutex<()> = Mutex::new(());
     let m = match feature {
         "stp" => &STP,
@@ -243,6 +248,11 @@ pub fn feature_lock(feature: &str) -> MutexGuard<'static, ()> {
         "system" => &SYSTEM,
         "acl" => &ACL,
         "aaa" => &AAA,
+        "mirror" => &MIRROR,
+        "storm-control" => &STORM_CONTROL,
+        "fdb" => &FDB,
+        "dhcp-relay" => &DHCP_RELAY,
+        "sflow" => &SFLOW,
         _ => &MISC,
     };
     m.lock().unwrap_or_else(|p| p.into_inner())

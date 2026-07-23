@@ -171,6 +171,39 @@ impl Probe {
         self.frr_daemon("isisd")
     }
 
+    /// Mirroring itself is core orchagent on every image; SPAN-type sessions
+    /// (`type=SPAN`, dst_port) only landed in 202012. Master and enterprise
+    /// builds count as newest.
+    pub fn span_mirror_supported(&self) -> bool {
+        self.enterprise || self.release.is_none_or(|r| r >= 202012)
+    }
+
+    /// PORT_STORM_CONTROL orchagent support merged for community 202205;
+    /// enterprise carries its own BUM storm control against the same table.
+    pub fn storm_control_supported(&self) -> bool {
+        self.enterprise || self.release.is_none_or(|r| r >= 202205)
+    }
+
+    /// The MAC-table config knobs — SWITCH|switch `fdb_aging_time` and
+    /// static CONFIG_DB FDB entries (`config mac …`) — are consumed by
+    /// orchagent since community 202205 (and on enterprise). Older images
+    /// show the learned table read-only.
+    pub fn fdb_config_writable(&self) -> bool {
+        self.enterprise || self.release.is_none_or(|r| r >= 202205)
+    }
+
+    /// DHCP relay needs the dhcp_relay container to consume the VLANs'
+    /// dhcp_servers lists.
+    pub fn dhcp_relay_supported(&self) -> bool {
+        self.has_feature("dhcp_relay") || self.docker_running("dhcp_relay")
+    }
+
+    /// sFlow is configurable when the image ships the feature at all; the
+    /// caller downgrades to read-only when the docker isn't running.
+    pub fn sflow_present(&self) -> bool {
+        self.has_feature("sflow") || self.docker_running("sflow")
+    }
+
     /// FRR changes need `vtysh -c "write memory"` only when FRR owns its own
     /// config file (split modes); in unified/separated modes CONFIG_DB is the
     /// source of truth and `config save` covers persistence.

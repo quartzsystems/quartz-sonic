@@ -34,6 +34,19 @@
 //!   PUT    /api/switching/lldp/config                  — enable/disable (+ timers on enterprise)
 //!   GET    /api/switching/igmp-snooping                — per-VLAN snooping + groups (enterprise)
 //!   PUT    /api/switching/igmp-snooping/vlans/{id}     — per-VLAN snooping config
+//!   GET    /api/switching/mirror-sessions              — SPAN/ERSPAN sessions + oper status
+//!   PUT    /api/switching/mirror-sessions/{name}       — upsert (replace) one session
+//!   DELETE /api/switching/mirror-sessions/{name}       — refused while an ACL rule mirrors to it
+//!   GET    /api/switching/storm-control                — per-port BUM kbps limits
+//!   PUT    /api/switching/storm-control/{port}         — full desired limits (null clears a class)
+//!   GET    /api/switching/fdb                          — aging time + static MAC entries
+//!   PUT    /api/switching/fdb/settings                 — aging time (null = image default)
+//!   PUT    /api/switching/fdb/static/{vlan}/{mac}      — upsert a static entry (body: port)
+//!   DELETE /api/switching/fdb/static/{vlan}/{mac}
+//!   GET    /api/switching/fdb/table                    — the learned table, as `show mac` sees it
+//!   GET    /api/switching/sflow                        — globals + collectors + per-port sessions
+//!   PUT    /api/switching/sflow                        — globals + full collector set (max two)
+//!   PUT    /api/switching/sflow/ports/{name}           — per-port session (rate null = default)
 //!
 //! Configure → Routing:
 //!   GET    /api/routing/l3-interfaces                  — all L3-capable interfaces
@@ -61,6 +74,8 @@
 //!   GET    /api/routing/static-routes                  — STATIC_ROUTE rows as route documents
 //!   PUT    /api/routing/static-routes                  — upsert one (vrf, prefix) route
 //!   POST   /api/routing/static-routes/delete           — delete (POST-with-body: prefixes carry /)
+//!   GET    /api/routing/dhcp-relay                     — per-VLAN dhcp_servers overview
+//!   PUT    /api/routing/dhcp-relay/{vlan_id}           — full desired server set (empty = off)
 //!   GET    /api/routing/policy                         — prefix lists + route maps (vtysh)
 //!   PUT    /api/routing/policy/prefix-lists/{name}     — atomic whole-list replace
 //!   DELETE /api/routing/policy/prefix-lists/{name}     — refused while a route map matches it
@@ -110,7 +125,10 @@ use serde_json::json;
 use crate::sonic;
 use crate::sonic::store::{Platform, SysPlatform};
 use crate::sonic::switching::{self, WriteError};
-use crate::sonic::{aaa, acl, bgp, igmp, isis, l3, lldp, ospf, policy, staticroutes, stp, system};
+use crate::sonic::{
+    aaa, acl, bgp, dhcprelay, fdb, igmp, isis, l3, lldp, mirror, ospf, policy, sflow,
+    staticroutes, stormcontrol, stp, system,
+};
 
 /// A ProxyResponse body-tuple: (http_status, content_type, body, error).
 pub type CallResult = (u32, String, Vec<u8>, String);
@@ -149,6 +167,21 @@ enum Route {
     LldpConfigPut,
     IgmpGet,
     IgmpVlanPut(u32),
+    MirrorGet,
+    MirrorSessionPut(String),
+    MirrorSessionDelete(String),
+    StormControlGet,
+    StormControlPortPut(String),
+    FdbGet,
+    FdbSettingsPut,
+    FdbStaticPut(u32, String),
+    FdbStaticDelete(u32, String),
+    FdbTableGet,
+    DhcpRelayGet,
+    DhcpRelayVlanPut(u32),
+    SflowGet,
+    SflowPut,
+    SflowPortPut(String),
     L3Get,
     L3Create,
     L3Put(String),
@@ -310,6 +343,36 @@ fn route_features(method: &str, path: &str) -> Route {
             Ok(id) => need("PUT", Route::IgmpVlanPut(id)),
             Err(_) => Route::NotFound,
         },
+        ["api", "switching", "mirror-sessions"] => need("GET", Route::MirrorGet),
+        ["api", "switching", "mirror-sessions", name] => match method {
+            "PUT" => Route::MirrorSessionPut(name.to_string()),
+            "DELETE" => Route::MirrorSessionDelete(name.to_string()),
+            _ => Route::MethodNotAllowed { allowed: "PUT, DELETE" },
+        },
+        ["api", "switching", "storm-control"] => need("GET", Route::StormControlGet),
+        ["api", "switching", "storm-control", port] => {
+            need("PUT", Route::StormControlPortPut(port.to_string()))
+        }
+        ["api", "switching", "fdb"] => need("GET", Route::FdbGet),
+        ["api", "switching", "fdb", "settings"] => need("PUT", Route::FdbSettingsPut),
+        ["api", "switching", "fdb", "table"] => need("GET", Route::FdbTableGet),
+        // The MAC may arrive percent-encoded (the console encodes the colons).
+        ["api", "switching", "fdb", "static", vlan, mac] => match vlan.parse() {
+            Err(_) => Route::NotFound,
+            Ok(id) => match method {
+                "PUT" => Route::FdbStaticPut(id, percent_decode(mac)),
+                "DELETE" => Route::FdbStaticDelete(id, percent_decode(mac)),
+                _ => Route::MethodNotAllowed { allowed: "PUT, DELETE" },
+            },
+        },
+        ["api", "switching", "sflow"] => match method {
+            "GET" => Route::SflowGet,
+            "PUT" => Route::SflowPut,
+            _ => Route::MethodNotAllowed { allowed: "GET, PUT" },
+        },
+        ["api", "switching", "sflow", "ports", name] => {
+            need("PUT", Route::SflowPortPut(name.to_string()))
+        }
         ["api", "routing", "l3-interfaces"] => match method {
             "GET" => Route::L3Get,
             "POST" => Route::L3Create,
@@ -368,6 +431,11 @@ fn route_features(method: &str, path: &str) -> Route {
             _ => Route::MethodNotAllowed { allowed: "GET, PUT" },
         },
         ["api", "routing", "static-routes", "delete"] => need("POST", Route::StaticRouteDelete),
+        ["api", "routing", "dhcp-relay"] => need("GET", Route::DhcpRelayGet),
+        ["api", "routing", "dhcp-relay", id] => match id.parse() {
+            Ok(id) => need("PUT", Route::DhcpRelayVlanPut(id)),
+            Err(_) => Route::NotFound,
+        },
         ["api", "routing", "policy"] => need("GET", Route::PolicyGet),
         ["api", "routing", "policy", "prefix-lists", name] => match method {
             "PUT" => Route::PolicyPrefixListPut(name.to_string()),
@@ -463,6 +531,29 @@ fn route_features(method: &str, path: &str) -> Route {
 /// The single path segment after `prefix`; None when absent, empty, or nested.
 fn item_name<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
     path.strip_prefix(prefix).filter(|s| !s.is_empty() && !s.contains('/'))
+}
+
+/// Decode %XX escapes in a path segment (the console percent-encodes MAC
+/// colons). Malformed escapes pass through verbatim — the handler's own
+/// validation rejects them with a useful message.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if let Some(hex) = s.get(i + 1..i + 3) {
+                if let Ok(v) = u8::from_str_radix(hex, 16) {
+                    out.push(v);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 impl Api {
@@ -584,6 +675,69 @@ impl Api {
                 run_blocking(move || {
                     with_platform_body(&body, true, |p, i: &igmp::VlanInput| {
                         igmp::put_vlan(p, id, i)
+                    })
+                })
+                .await
+            }
+            Route::MirrorGet => run_blocking(|| doc_get(mirror::get)).await,
+            Route::MirrorSessionPut(name) => {
+                run_blocking(move || {
+                    with_platform_body(&body, true, |p, i: &mirror::SessionInput| {
+                        mirror::put_session(p, &name, i)
+                    })
+                })
+                .await
+            }
+            Route::MirrorSessionDelete(name) => {
+                run_blocking(move || platform_write(true, |p| mirror::delete_session(p, &name)))
+                    .await
+            }
+            Route::StormControlGet => run_blocking(|| doc_get(stormcontrol::get)).await,
+            Route::StormControlPortPut(port) => {
+                run_blocking(move || {
+                    with_platform_body(&body, true, |p, i: &stormcontrol::PortInput| {
+                        stormcontrol::put_port(p, &port, i)
+                    })
+                })
+                .await
+            }
+            Route::FdbGet => run_blocking(|| doc_get(fdb::get)).await,
+            Route::FdbSettingsPut => {
+                run_blocking(move || {
+                    with_platform_body(&body, true, |p, i: &fdb::SettingsInput| {
+                        fdb::put_settings(p, i)
+                    })
+                })
+                .await
+            }
+            Route::FdbStaticPut(vlan_id, mac) => {
+                run_blocking(move || {
+                    with_platform_body(&body, true, |p, i: &fdb::StaticEntryInput| {
+                        fdb::put_static(p, vlan_id, &mac, i)
+                    })
+                })
+                .await
+            }
+            Route::FdbStaticDelete(vlan_id, mac) => {
+                run_blocking(move || {
+                    platform_write(true, |p| fdb::delete_static(p, vlan_id, &mac))
+                })
+                .await
+            }
+            Route::FdbTableGet => run_blocking(|| doc_get(fdb::get_table)).await,
+            Route::SflowGet => run_blocking(|| doc_get(sflow::get)).await,
+            Route::SflowPut => {
+                run_blocking(move || {
+                    with_platform_body(&body, true, |p, i: &sflow::GlobalInput| {
+                        sflow::put_global(p, i)
+                    })
+                })
+                .await
+            }
+            Route::SflowPortPut(name) => {
+                run_blocking(move || {
+                    with_platform_body(&body, true, |p, i: &sflow::PortInput| {
+                        sflow::put_port(p, &name, i)
                     })
                 })
                 .await
@@ -714,6 +868,15 @@ impl Api {
                 run_blocking(move || {
                     with_platform_body(&body, false, |p, i: &isis::InterfaceInput| {
                         isis::put_interface(p, &name, i)
+                    })
+                })
+                .await
+            }
+            Route::DhcpRelayGet => run_blocking(|| doc_get(dhcprelay::get)).await,
+            Route::DhcpRelayVlanPut(vlan_id) => {
+                run_blocking(move || {
+                    with_platform_body(&body, true, |p, i: &dhcprelay::VlanInput| {
+                        dhcprelay::put_vlan(p, vlan_id, i)
                     })
                 })
                 .await
@@ -1429,6 +1592,62 @@ mod tests {
             route("GET", "/api/security/aaa/authentication"),
             Route::MethodNotAllowed { allowed: "PUT" }
         );
+    }
+
+    #[test]
+    fn routes_l2ops_endpoints() {
+        assert_eq!(route("GET", "/api/switching/mirror-sessions"), Route::MirrorGet);
+        assert_eq!(
+            route("PUT", "/api/switching/mirror-sessions/capture-uplink"),
+            Route::MirrorSessionPut("capture-uplink".into())
+        );
+        assert_eq!(
+            route("DELETE", "/api/switching/mirror-sessions/capture-uplink"),
+            Route::MirrorSessionDelete("capture-uplink".into())
+        );
+        assert_eq!(
+            route("POST", "/api/switching/mirror-sessions/x"),
+            Route::MethodNotAllowed { allowed: "PUT, DELETE" }
+        );
+        assert_eq!(route("GET", "/api/switching/storm-control"), Route::StormControlGet);
+        assert_eq!(
+            route("PUT", "/api/switching/storm-control/Ethernet0"),
+            Route::StormControlPortPut("Ethernet0".into())
+        );
+        assert_eq!(route("GET", "/api/switching/fdb"), Route::FdbGet);
+        assert_eq!(route("PUT", "/api/switching/fdb/settings"), Route::FdbSettingsPut);
+        assert_eq!(route("GET", "/api/switching/fdb/table"), Route::FdbTableGet);
+        // The MAC segment travels raw or percent-encoded — both decode.
+        assert_eq!(
+            route("PUT", "/api/switching/fdb/static/10/00:11:22:33:44:55"),
+            Route::FdbStaticPut(10, "00:11:22:33:44:55".into())
+        );
+        assert_eq!(
+            route("DELETE", "/api/switching/fdb/static/10/00%3A11%3A22%3A33%3A44%3A55"),
+            Route::FdbStaticDelete(10, "00:11:22:33:44:55".into())
+        );
+        assert_eq!(route("PUT", "/api/switching/fdb/static/abc/00:11:22:33:44:55"), Route::NotFound);
+        assert_eq!(route("GET", "/api/routing/dhcp-relay"), Route::DhcpRelayGet);
+        assert_eq!(route("PUT", "/api/routing/dhcp-relay/10"), Route::DhcpRelayVlanPut(10));
+        assert_eq!(route("PUT", "/api/routing/dhcp-relay/abc"), Route::NotFound);
+        assert_eq!(route("GET", "/api/switching/sflow"), Route::SflowGet);
+        assert_eq!(route("PUT", "/api/switching/sflow"), Route::SflowPut);
+        assert_eq!(
+            route("PUT", "/api/switching/sflow/ports/Ethernet0"),
+            Route::SflowPortPut("Ethernet0".into())
+        );
+        assert_eq!(
+            route("DELETE", "/api/switching/sflow"),
+            Route::MethodNotAllowed { allowed: "GET, PUT" }
+        );
+    }
+
+    #[test]
+    fn percent_decoding_is_defensive() {
+        assert_eq!(percent_decode("00%3A11%3a22"), "00:11:22");
+        assert_eq!(percent_decode("plain"), "plain");
+        // Malformed escapes pass through for the handler to reject.
+        assert_eq!(percent_decode("bad%zz%"), "bad%zz%");
     }
 
     /// Feature write bodies parse before any platform access, so bad
