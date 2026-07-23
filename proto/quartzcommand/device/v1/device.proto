@@ -192,6 +192,15 @@ message DeviceStats {
   uint64 mem_total_bytes = 10;
   uint64 disk_used_bytes = 11;
   uint64 disk_total_bytes = 12;
+
+  // Uplink throughput averaged over the report interval, in bits per second,
+  // computed from the delta of cumulative interface octet counters between
+  // successive reports. 0/0 means "not measured": the first report after the
+  // agent starts (no previous sample to delta against) or the counters being
+  // unreadable. A counter reset (negative delta) clamps the affected
+  // direction to 0 for that one interval.
+  uint64 rx_bps = 13;
+  uint64 tx_bps = 14;
 }
 
 // One firewall policy/rule's cumulative traffic counters.

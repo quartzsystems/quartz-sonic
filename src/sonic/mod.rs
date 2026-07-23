@@ -262,6 +262,38 @@ pub fn counters_for(name: String, h: &HashMap<String, String>) -> IfaceCounters 
     IfaceCounters { name, bytes, packets }
 }
 
+/// Cumulative rx/tx octet totals summed across ports (for the DeviceStats
+/// rx_bps/tx_bps throughput delta).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PortOctets {
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+}
+
+/// Sum the cumulative in/out octets of every port in COUNTERS_PORT_NAME_MAP.
+/// The uplink role isn't modeled in CONFIG_DB yet, so this counts ALL
+/// front-panel ports — narrow it to uplink-role ports once that lands.
+/// COUNTERS_DB is the only valid source here: /sys/class/net statistics on
+/// SONiC see just CPU-punted traffic, not what the ASIC forwards.
+pub fn total_port_octets() -> Result<PortOctets> {
+    let name_map = hgetall(COUNTERS_DB, "COUNTERS_PORT_NAME_MAP")?;
+    let mut conn = connection(COUNTERS_DB)?;
+    let mut total = PortOctets::default();
+    for oid in name_map.values() {
+        let (rx, tx) = octets_for(&hgetall_on(&mut conn, &format!("COUNTERS:{oid}")));
+        total.rx_bytes = total.rx_bytes.saturating_add(rx);
+        total.tx_bytes = total.tx_bytes.saturating_add(tx);
+    }
+    Ok(total)
+}
+
+/// (in, out) octets from a COUNTERS:<oid> hash; missing or unparsable fields
+/// count as 0, like `counters_for`.
+pub fn octets_for(h: &HashMap<String, String>) -> (u64, u64) {
+    let get = |k: &str| h.get(k).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    (get("SAI_PORT_STAT_IF_IN_OCTETS"), get("SAI_PORT_STAT_IF_OUT_OCTETS"))
+}
+
 /// Pure half of `top_interfaces`: drop zero-traffic ports, sort descending by
 /// bytes (ties broken by name for a stable order), cap.
 pub fn rank_interfaces(mut list: Vec<IfaceCounters>, cap: usize) -> Vec<PolicyStat> {
@@ -309,6 +341,18 @@ mod tests {
         assert_eq!(c.packets, 0);
         let empty = counters_for("Ethernet8".into(), &HashMap::new());
         assert_eq!(empty.bytes, 0);
+    }
+
+    #[test]
+    fn octets_split_in_and_out() {
+        let (rx, tx) = octets_for(&h(&[
+            ("SAI_PORT_STAT_IF_IN_OCTETS", "1000"),
+            ("SAI_PORT_STAT_IF_OUT_OCTETS", "2500"),
+            ("SAI_PORT_STAT_IF_IN_UCAST_PKTS", "10"), // irrelevant field ignored
+        ]));
+        assert_eq!((rx, tx), (1000, 2500));
+        assert_eq!(octets_for(&h(&[("SAI_PORT_STAT_IF_IN_OCTETS", "junk")])), (0, 0));
+        assert_eq!(octets_for(&HashMap::new()), (0, 0));
     }
 
     #[test]

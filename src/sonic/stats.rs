@@ -22,8 +22,13 @@
 //!                 COUNTERS_DB (`name` = interface, `bytes`/`hits` =
 //!                 octets/packets), so the console's "most active" table
 //!                 shows meaningful data for a switch.
+//!   rx_bps/tx_bps — throughput averaged since the previous snapshot: delta
+//!                 of the summed COUNTERS_DB port octet counters over the
+//!                 real elapsed time, in bits/sec. 0/0 on the first tick or
+//!                 when counters are unreadable ("not measured").
 
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use crate::proto::device::DeviceStats;
 use crate::sonic;
@@ -45,6 +50,7 @@ pub fn collect() -> DeviceStats {
     // figures come from the same sample so they can't disagree.
     let mem = read_mem();
     let disk = read_disk("/");
+    let (rx_bps, tx_bps) = throughput_bps();
     DeviceStats {
         time_unix: crate::state::now_unix(),
         interval_secs: INTERVAL.as_secs() as u32,
@@ -58,7 +64,53 @@ pub fn collect() -> DeviceStats {
         mem_total_bytes: mem.map(|m| m.total_bytes).unwrap_or(0),
         disk_used_bytes: disk.map(|d| d.used_bytes).unwrap_or(0),
         disk_total_bytes: disk.map(|d| d.total_bytes).unwrap_or(0),
+        rx_bps,
+        tx_bps,
     }
+}
+
+// ── uplink throughput ───────────────────────────────────────────────────────
+
+/// The previous tick's cumulative octet totals. Process-global because
+/// `collect` is called as a plain fn from a blocking task; deliberately
+/// survives control-stream reconnects — the counters are cumulative, so a
+/// longer-than-nominal gap still averages correctly over its real elapsed
+/// time.
+static LAST_OCTETS: Mutex<Option<(sonic::PortOctets, Instant)>> = Mutex::new(None);
+
+/// Average bits/sec since the previous snapshot, from the summed front-panel
+/// port octet counters (see `sonic::total_port_octets` — the uplink role
+/// isn't modeled yet, so all front-panel ports count). (0, 0) — the
+/// contract's "not measured" — on the first tick and whenever the counters
+/// are unreadable; an unreadable tick keeps the last good sample so the next
+/// reading still averages over the full gap.
+fn throughput_bps() -> (u64, u64) {
+    let cur = match sonic::total_port_octets() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::debug!("port octet counters unavailable: {e:#}");
+            return (0, 0);
+        }
+    };
+    let now = Instant::now();
+    let mut last = LAST_OCTETS.lock().unwrap_or_else(|p| p.into_inner());
+    let out = match *last {
+        Some((prev, at)) => bps_from(prev, cur, now.duration_since(at).as_secs_f64()),
+        None => (0, 0),
+    };
+    *last = Some((cur, now));
+    out
+}
+
+/// Pure half of `throughput_bps`: (rx_bps, tx_bps) between two cumulative
+/// samples. A negative delta (counter reset) clamps that direction to 0 for
+/// the interval; a non-positive elapsed time yields (0, 0).
+fn bps_from(prev: sonic::PortOctets, cur: sonic::PortOctets, elapsed_secs: f64) -> (u64, u64) {
+    if elapsed_secs <= 0.0 {
+        return (0, 0);
+    }
+    let bps = |p: u64, c: u64| (c.saturating_sub(p) as f64 * 8.0 / elapsed_secs) as u64;
+    (bps(prev.rx_bytes, cur.rx_bytes), bps(prev.tx_bytes, cur.tx_bytes))
 }
 
 /// Clamp a gauge to the 0–100 range the contract promises.
@@ -292,6 +344,28 @@ mod tests {
         assert_eq!(uptime_from("12345.67 98765.43\n"), Some(12345));
         assert_eq!(uptime_from("0.00 0.00"), Some(0));
         assert_eq!(uptime_from(""), None);
+    }
+
+    #[test]
+    fn throughput_averages_octet_deltas_over_elapsed_time() {
+        use crate::sonic::PortOctets;
+        let prev = PortOctets { rx_bytes: 1_000, tx_bytes: 500 };
+        // +3000 rx bytes and +750 tx bytes over 30 s → 800 / 200 bits/sec.
+        let cur = PortOctets { rx_bytes: 4_000, tx_bytes: 1_250 };
+        assert_eq!(bps_from(prev, cur, 30.0), (800, 200));
+        // No traffic → 0/0.
+        assert_eq!(bps_from(prev, prev, 30.0), (0, 0));
+    }
+
+    #[test]
+    fn throughput_clamps_counter_resets_per_direction() {
+        use crate::sonic::PortOctets;
+        // rx counter went backwards (reset) while tx advanced: only rx clamps.
+        let prev = PortOctets { rx_bytes: 9_000, tx_bytes: 1_000 };
+        let cur = PortOctets { rx_bytes: 100, tx_bytes: 1_375 };
+        assert_eq!(bps_from(prev, cur, 30.0), (0, 100));
+        // A degenerate window (no elapsed time) has nothing to average over.
+        assert_eq!(bps_from(prev, cur, 0.0), (0, 0));
     }
 
     #[test]
