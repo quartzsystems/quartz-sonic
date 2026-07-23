@@ -81,6 +81,29 @@
 //!   DELETE /api/routing/policy/prefix-lists/{name}     — refused while a route map matches it
 //!   PUT    /api/routing/policy/route-maps/{name}       — entries replace the live set
 //!   DELETE /api/routing/policy/route-maps/{name}       — refused while BGP/OSPF applies it
+//!   GET    /api/routing/bfd                             — configured bfdd peers (vtysh/FRR)
+//!   PUT    /api/routing/bfd/peers                       — upsert one peer (atomic replace)
+//!   POST   /api/routing/bfd/peers/delete                — delete (POST-with-body: addresses)
+//!   GET    /api/routing/bfd/sessions                    — live sessions incl. BGP/OSPF-raised
+//!   GET    /api/routing/vxlan                           — VTEP + EVPN NVO + VLAN↔VNI maps
+//!   PUT    /api/routing/vxlan/vtep                      — upsert the VTEP (+ NVO binding)
+//!   DELETE /api/routing/vxlan/vtep                      — refused while VNI maps exist
+//!   PUT    /api/routing/vxlan/maps                      — full desired VLAN↔VNI set (diffed)
+//!   GET    /api/routing/vxlan/status                    — remote VTEPs + mapping oper state
+//!
+//! High Availability (pair features — the console writes each switch's half):
+//!   GET    /api/ha/mclag                                — domain config + iccpd session state
+//!   PUT    /api/ha/mclag                                — upsert the switch's MCLAG domain
+//!   DELETE /api/ha/mclag                                — remove the domain + member rows
+//!   GET    /api/ha/vrrp                                 — VRRP groups + master/backup state
+//!   PUT    /api/ha/vrrp/{interface}/{vrid}              — upsert one group
+//!   DELETE /api/ha/vrrp/{interface}/{vrid}
+//!
+//! Configure → QoS (phase 1: trust + DSCP→TC maps):
+//!   GET    /api/qos                                     — DSCP→TC maps + per-port trust
+//!   PUT    /api/qos/dscp-maps/{name}                    — the full desired map (replace)
+//!   DELETE /api/qos/dscp-maps/{name}                    — refused while ports bind it
+//!   PUT    /api/qos/ports/{port}                        — trust mode + map binding
 //!
 //! Configure → System:
 //!   GET/PUT /api/system/general                        — hostname/timezone/NTP/syslog
@@ -126,8 +149,8 @@ use crate::sonic;
 use crate::sonic::store::{Platform, SysPlatform};
 use crate::sonic::switching::{self, WriteError};
 use crate::sonic::{
-    aaa, acl, bgp, dhcprelay, fdb, igmp, isis, l3, lldp, mirror, ospf, policy, sflow,
-    staticroutes, stormcontrol, stp, system,
+    aaa, acl, bfd, bgp, dhcprelay, fdb, igmp, isis, l3, lldp, mclag, mirror, ospf, policy, qos,
+    sflow, staticroutes, stormcontrol, stp, system, vrrp, vxlan,
 };
 
 /// A ProxyResponse body-tuple: (http_status, content_type, body, error).
@@ -234,6 +257,25 @@ enum Route {
     AclDelete(String),
     AclRulePut(String, u32),
     AclRuleDelete(String, u32),
+    MclagGet,
+    MclagPut,
+    MclagDelete,
+    VrrpGet,
+    VrrpPut(String, u32),
+    VrrpDelete(String, u32),
+    BfdGet,
+    BfdPeerPut,
+    BfdPeerDelete,
+    BfdSessionsGet,
+    VxlanGet,
+    VxlanVtepPut,
+    VxlanVtepDelete,
+    VxlanMapsPut,
+    VxlanStatusGet,
+    QosGet,
+    QosDscpMapPut(String),
+    QosDscpMapDelete(String),
+    QosPortPut(String),
     AaaGet,
     AaaAuthPut,
     AaaGlobalPut(aaa::Proto),
@@ -436,6 +478,43 @@ fn route_features(method: &str, path: &str) -> Route {
             Ok(id) => need("PUT", Route::DhcpRelayVlanPut(id)),
             Err(_) => Route::NotFound,
         },
+        ["api", "routing", "bfd"] => need("GET", Route::BfdGet),
+        ["api", "routing", "bfd", "peers"] => need("PUT", Route::BfdPeerPut),
+        // Peer addresses aren't path-safe — deletes are POST-with-body.
+        ["api", "routing", "bfd", "peers", "delete"] => need("POST", Route::BfdPeerDelete),
+        ["api", "routing", "bfd", "sessions"] => need("GET", Route::BfdSessionsGet),
+        ["api", "routing", "vxlan"] => need("GET", Route::VxlanGet),
+        ["api", "routing", "vxlan", "vtep"] => match method {
+            "PUT" => Route::VxlanVtepPut,
+            "DELETE" => Route::VxlanVtepDelete,
+            _ => Route::MethodNotAllowed { allowed: "PUT, DELETE" },
+        },
+        ["api", "routing", "vxlan", "maps"] => need("PUT", Route::VxlanMapsPut),
+        ["api", "routing", "vxlan", "status"] => need("GET", Route::VxlanStatusGet),
+        ["api", "ha", "mclag"] => match method {
+            "GET" => Route::MclagGet,
+            "PUT" => Route::MclagPut,
+            "DELETE" => Route::MclagDelete,
+            _ => Route::MethodNotAllowed { allowed: "GET, PUT, DELETE" },
+        },
+        ["api", "ha", "vrrp"] => need("GET", Route::VrrpGet),
+        // The interface may arrive percent-encoded; a non-numeric vrid can't
+        // name a group — 404, not 405.
+        ["api", "ha", "vrrp", iface, vrid] => match vrid.parse() {
+            Err(_) => Route::NotFound,
+            Ok(vrid) => match method {
+                "PUT" => Route::VrrpPut(percent_decode(iface), vrid),
+                "DELETE" => Route::VrrpDelete(percent_decode(iface), vrid),
+                _ => Route::MethodNotAllowed { allowed: "PUT, DELETE" },
+            },
+        },
+        ["api", "qos"] => need("GET", Route::QosGet),
+        ["api", "qos", "dscp-maps", name] => match method {
+            "PUT" => Route::QosDscpMapPut(percent_decode(name)),
+            "DELETE" => Route::QosDscpMapDelete(percent_decode(name)),
+            _ => Route::MethodNotAllowed { allowed: "PUT, DELETE" },
+        },
+        ["api", "qos", "ports", name] => need("PUT", Route::QosPortPut(percent_decode(name))),
         ["api", "routing", "policy"] => need("GET", Route::PolicyGet),
         ["api", "routing", "policy", "prefix-lists", name] => match method {
             "PUT" => Route::PolicyPrefixListPut(name.to_string()),
@@ -1040,6 +1119,87 @@ impl Api {
                 })
                 .await
             }
+            // ── High Availability (pair features) ───────────────────────────
+            Route::MclagGet => run_blocking(|| doc_get(mclag::get)).await,
+            Route::MclagPut => {
+                run_blocking(move || {
+                    with_platform_body(&body, true, |p, i: &mclag::DomainInput| mclag::put(p, i))
+                })
+                .await
+            }
+            Route::MclagDelete => run_blocking(|| platform_write(true, mclag::delete)).await,
+            Route::VrrpGet => run_blocking(|| doc_get(vrrp::get)).await,
+            Route::VrrpPut(iface, vrid) => {
+                run_blocking(move || {
+                    with_platform_body(&body, true, |p, i: &vrrp::GroupInput| {
+                        vrrp::put(p, &iface, vrid, i)
+                    })
+                })
+                .await
+            }
+            Route::VrrpDelete(iface, vrid) => {
+                run_blocking(move || platform_write(true, |p| vrrp::delete(p, &iface, vrid)))
+                    .await
+            }
+            // BFD lives in FRR, not CONFIG_DB — the module runs
+            // `vtysh -c "write memory"` itself per the routing-config mode.
+            Route::BfdGet => run_blocking(|| doc_get(bfd::get)).await,
+            Route::BfdPeerPut => {
+                run_blocking(move || {
+                    with_platform_body(&body, false, |p, i: &bfd::PeerInput| bfd::put_peer(p, i))
+                })
+                .await
+            }
+            Route::BfdPeerDelete => {
+                run_blocking(move || {
+                    with_platform_body(&body, false, |p, i: &bfd::PeerKey| bfd::delete_peer(p, i))
+                })
+                .await
+            }
+            Route::BfdSessionsGet => run_blocking(|| doc_get(bfd::get_sessions)).await,
+            Route::VxlanGet => run_blocking(|| doc_get(vxlan::get)).await,
+            Route::VxlanVtepPut => {
+                run_blocking(move || {
+                    with_platform_body(&body, true, |p, i: &vxlan::VtepInput| {
+                        vxlan::put_vtep(p, i)
+                    })
+                })
+                .await
+            }
+            Route::VxlanVtepDelete => {
+                run_blocking(|| platform_write(true, vxlan::delete_vtep)).await
+            }
+            Route::VxlanMapsPut => {
+                run_blocking(move || {
+                    with_platform_body(&body, true, |p, i: &vxlan::MapsInput| {
+                        vxlan::put_maps(p, i)
+                    })
+                })
+                .await
+            }
+            Route::VxlanStatusGet => run_blocking(|| doc_get(vxlan::get_status)).await,
+            // ── Configure → QoS ─────────────────────────────────────────────
+            Route::QosGet => run_blocking(|| doc_get(qos::get)).await,
+            Route::QosDscpMapPut(name) => {
+                run_blocking(move || {
+                    with_platform_body(&body, true, |p, i: &qos::MapInput| {
+                        qos::put_dscp_map(p, &name, i)
+                    })
+                })
+                .await
+            }
+            Route::QosDscpMapDelete(name) => {
+                run_blocking(move || platform_write(true, |p| qos::delete_dscp_map(p, &name)))
+                    .await
+            }
+            Route::QosPortPut(port) => {
+                run_blocking(move || {
+                    with_platform_body(&body, true, |p, i: &qos::PortInput| {
+                        qos::put_port(p, &port, i)
+                    })
+                })
+                .await
+            }
             Route::AaaGet => run_blocking(|| doc_get(aaa::get)).await,
             Route::AaaAuthPut => {
                 run_blocking(move || {
@@ -1640,6 +1800,83 @@ mod tests {
             route("DELETE", "/api/switching/sflow"),
             Route::MethodNotAllowed { allowed: "GET, PUT" }
         );
+    }
+
+    #[test]
+    fn routes_ha_overlay_endpoints() {
+        assert_eq!(route("GET", "/api/ha/mclag"), Route::MclagGet);
+        assert_eq!(route("PUT", "/api/ha/mclag"), Route::MclagPut);
+        assert_eq!(route("DELETE", "/api/ha/mclag"), Route::MclagDelete);
+        assert_eq!(
+            route("POST", "/api/ha/mclag"),
+            Route::MethodNotAllowed { allowed: "GET, PUT, DELETE" }
+        );
+        assert_eq!(route("GET", "/api/ha/vrrp"), Route::VrrpGet);
+        assert_eq!(route("PUT", "/api/ha/vrrp/Vlan10/1"), Route::VrrpPut("Vlan10".into(), 1));
+        assert_eq!(
+            route("DELETE", "/api/ha/vrrp/Vlan10/1"),
+            Route::VrrpDelete("Vlan10".into(), 1)
+        );
+        // A non-numeric vrid can't name a group.
+        assert_eq!(route("PUT", "/api/ha/vrrp/Vlan10/abc"), Route::NotFound);
+
+        assert_eq!(route("GET", "/api/routing/bfd"), Route::BfdGet);
+        assert_eq!(route("PUT", "/api/routing/bfd/peers"), Route::BfdPeerPut);
+        assert_eq!(route("POST", "/api/routing/bfd/peers/delete"), Route::BfdPeerDelete);
+        assert_eq!(route("GET", "/api/routing/bfd/sessions"), Route::BfdSessionsGet);
+        assert_eq!(
+            route("DELETE", "/api/routing/bfd/peers"),
+            Route::MethodNotAllowed { allowed: "PUT" }
+        );
+
+        assert_eq!(route("GET", "/api/routing/vxlan"), Route::VxlanGet);
+        assert_eq!(route("PUT", "/api/routing/vxlan/vtep"), Route::VxlanVtepPut);
+        assert_eq!(route("DELETE", "/api/routing/vxlan/vtep"), Route::VxlanVtepDelete);
+        assert_eq!(route("PUT", "/api/routing/vxlan/maps"), Route::VxlanMapsPut);
+        assert_eq!(route("GET", "/api/routing/vxlan/status"), Route::VxlanStatusGet);
+        assert_eq!(
+            route("GET", "/api/routing/vxlan/vtep"),
+            Route::MethodNotAllowed { allowed: "PUT, DELETE" }
+        );
+
+        assert_eq!(route("GET", "/api/qos"), Route::QosGet);
+        assert_eq!(
+            route("PUT", "/api/qos/dscp-maps/AZURE"),
+            Route::QosDscpMapPut("AZURE".into())
+        );
+        assert_eq!(
+            route("DELETE", "/api/qos/dscp-maps/AZURE"),
+            Route::QosDscpMapDelete("AZURE".into())
+        );
+        assert_eq!(
+            route("PUT", "/api/qos/ports/Ethernet0"),
+            Route::QosPortPut("Ethernet0".into())
+        );
+        assert_eq!(
+            route("POST", "/api/qos/ports/Ethernet0"),
+            Route::MethodNotAllowed { allowed: "PUT" }
+        );
+    }
+
+    /// The new feature write bodies also parse before any platform access.
+    #[tokio::test]
+    async fn unparsable_ha_overlay_bodies_yield_400() {
+        let api = Api::new("test".into(), "QS-TEST".into());
+        for (method, path, body) in [
+            ("PUT", "/api/ha/mclag", &b"{not json"[..]),
+            ("PUT", "/api/ha/vrrp/Vlan10/1", br#"{"vrid":"one"}"#),
+            ("PUT", "/api/routing/bfd/peers", br#"{"peer":1}"#),
+            ("POST", "/api/routing/bfd/peers/delete", br#"{"interface":null}"#),
+            ("PUT", "/api/routing/vxlan/vtep", br#"{"name":"vtep1"}"#),
+            ("PUT", "/api/routing/vxlan/maps", br#"{"maps":[{"vlan_id":10}]}"#),
+            ("PUT", "/api/qos/dscp-maps/AZURE", br#"{"entries":[{"dscp":70}]}"#),
+            ("PUT", "/api/qos/ports/Ethernet0", br#"{"trust":"dot1p"}"#),
+        ] {
+            let (status, _, body_out, error) = api.call(method, path, JSON, body.to_vec()).await;
+            assert_eq!(status, 400, "{method} {path}: {error}");
+            let v: serde_json::Value = serde_json::from_slice(&body_out).unwrap();
+            assert!(v["error"].as_str().unwrap().starts_with("invalid body:"), "{v}");
+        }
     }
 
     #[test]

@@ -234,6 +234,11 @@ pub fn feature_lock(feature: &str) -> MutexGuard<'static, ()> {
     static FDB: Mutex<()> = Mutex::new(());
     static DHCP_RELAY: Mutex<()> = Mutex::new(());
     static SFLOW: Mutex<()> = Mutex::new(());
+    static MCLAG: Mutex<()> = Mutex::new(());
+    static VRRP: Mutex<()> = Mutex::new(());
+    static BFD: Mutex<()> = Mutex::new(());
+    static VXLAN: Mutex<()> = Mutex::new(());
+    static QOS: Mutex<()> = Mutex::new(());
     static MISC: Mutex<()> = Mutex::new(());
     let m = match feature {
         "stp" => &STP,
@@ -253,6 +258,11 @@ pub fn feature_lock(feature: &str) -> MutexGuard<'static, ()> {
         "fdb" => &FDB,
         "dhcp-relay" => &DHCP_RELAY,
         "sflow" => &SFLOW,
+        "mclag" => &MCLAG,
+        "vrrp" => &VRRP,
+        "bfd" => &BFD,
+        "vxlan" => &VXLAN,
+        "qos" => &QOS,
         _ => &MISC,
     };
     m.lock().unwrap_or_else(|p| p.into_inner())

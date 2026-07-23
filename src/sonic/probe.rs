@@ -204,6 +204,33 @@ impl Probe {
         self.has_feature("sflow") || self.docker_running("sflow")
     }
 
+    /// MCLAG needs iccpd consuming MCLAG_DOMAIN: enterprise stacks ship it,
+    /// community images only when built with the mclag feature.
+    pub fn mclag_supported(&self) -> bool {
+        self.enterprise
+            || self.has_feature("mclag")
+            || self.has_feature("iccpd")
+            || self.docker_running("iccpd")
+            || self.docker_running("mclag")
+    }
+
+    /// vrrpd only ships on enterprise images (or community builds that
+    /// expose a vrrp feature).
+    pub fn vrrp_supported(&self) -> bool {
+        self.enterprise || self.has_feature("vrrp") || self.docker_running("vrrp")
+    }
+
+    /// BFD is programmed via FRR's bfdd inside the bgp container.
+    pub fn bfd_supported(&self) -> bool {
+        self.bgp_available() && self.frr_daemon("bfdd")
+    }
+
+    /// VXLAN orchestration (VXLAN_TUNNEL / VXLAN_TUNNEL_MAP) landed for
+    /// community 202012; enterprise and master builds count as newest.
+    pub fn vxlan_supported(&self) -> bool {
+        self.enterprise || self.release.is_none_or(|r| r >= 202012)
+    }
+
     /// FRR changes need `vtysh -c "write memory"` only when FRR owns its own
     /// config file (split modes); in unified/separated modes CONFIG_DB is the
     /// source of truth and `config save` covers persistence.
@@ -441,6 +468,39 @@ mod tests {
         assert_eq!(frr.bgp_mode(), BgpMode::Frrcfgd);
         let none = community("202311.1", &["lldp"], true);
         assert_eq!(none.bgp_mode(), BgpMode::Unavailable);
+    }
+
+    #[test]
+    fn ha_overlay_capabilities() {
+        let old = community("202311.140396", &["lldp", "bgp"], false);
+        assert!(!old.mclag_supported());
+        assert!(!old.vrrp_supported());
+        assert!(!old.bfd_supported()); // bfdd not in `show daemons`
+        assert!(old.vxlan_supported()); // 202311 >= 202012
+        assert!(!community("201911.5", &["bgp"], false).vxlan_supported());
+        let with_features = community("202505.12", &["bgp", "mclag", "vrrp"], false);
+        assert!(with_features.mclag_supported());
+        assert!(with_features.vrrp_supported());
+        // bfdd counts once vtysh lists it (and the bgp container exists).
+        let with_bfdd = assemble(
+            "build_version: '202311.1'\n",
+            h(&[("bgp", "enabled")]),
+            vec![],
+            &h(&[]),
+            vec!["zebra".into(), "bgpd".into(), "bfdd".into()],
+        );
+        assert!(with_bfdd.bfd_supported());
+        // Enterprise ships the whole HA stack.
+        let enterprise = assemble(
+            "build_version: '4.1.1'\nrelease: 'Enterprise SONiC OS'\n",
+            HashMap::new(),
+            vec![],
+            &h(&[]),
+            vec![],
+        );
+        assert!(enterprise.mclag_supported());
+        assert!(enterprise.vrrp_supported());
+        assert!(enterprise.vxlan_supported());
     }
 
     #[test]
